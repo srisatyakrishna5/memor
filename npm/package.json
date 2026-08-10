@@ -1,6 +1,6 @@
 {
   "name": "@memor-dev/memor",
-  "version": "0.7.",
+  "version": "v0.7",
   "description": "Local memory persistence for AI coding assistants. Zero cloud, zero git commits.",
   "publishConfig": {
     "access": "public"
