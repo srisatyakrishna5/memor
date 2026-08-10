@@ -1,10 +1,11 @@
 // stats.go — memor stats
 //
-// Shows entry counts, token usage, file sizes, and index health. Useful for
+// Shows entry counts, token usage, and file sizes. Useful for
 // monitoring memory growth and checking if compaction is needed.
 //
 // Examples:
-//   memor stats
+//
+//	memor stats
 package cmd
 
 import (
@@ -17,7 +18,7 @@ import (
 
 var statsCmd = &cobra.Command{
 	Use:   "stats",
-	Short: "Show entry counts, token usage, and index health",
+	Short: "Show entry counts, token usage, and file sizes",
 	RunE:  runStats,
 }
 

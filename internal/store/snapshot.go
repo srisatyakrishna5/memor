@@ -2,10 +2,11 @@ package store
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
-	"sort"
 	"strings"
 	"time"
 
@@ -22,6 +23,14 @@ type Snapshot struct {
 	Entries     []memory.Entry
 }
 
+// SnapshotWriteResult reports the exact partition produced by snapshot serialization.
+type SnapshotWriteResult struct {
+	Written []memory.Entry
+	Evicted []memory.Entry
+	header  string
+	lines   []string
+}
+
 var headerRegex = regexp.MustCompile(
 	`^@mem v(\S+) \| (\d+) entries \| budget:(\d+) \| compacted:(.+)$`,
 )
@@ -36,10 +45,15 @@ var codeEntryRegex = regexp.MustCompile(
 
 // ReadSnapshot parses memory.db from the compact DSL format.
 func ReadSnapshot(path string) (*Snapshot, error) {
+	canonicalEntries, canonicalExists, err := readCanonicalSnapshot(canonicalSnapshotPath(path))
+	if err != nil {
+		return nil, err
+	}
+
 	f, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return &Snapshot{Version: "1"}, nil
+			return &Snapshot{Version: "1", EntryCount: len(canonicalEntries), Entries: canonicalEntries}, nil
 		}
 		return nil, fmt.Errorf("open snapshot: %w", err)
 	}
@@ -154,58 +168,168 @@ func ReadSnapshot(path string) (*Snapshot, error) {
 		snap.Entries = append(snap.Entries, entry)
 	}
 
-	return snap, scanner.Err()
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	if canonicalExists {
+		snap.Entries = canonicalEntries
+		snap.EntryCount = len(canonicalEntries)
+	}
+	return snap, nil
 }
 
-// WriteSnapshot renders entries to memory.db in compact DSL format within the token budget.
-func WriteSnapshot(path string, entries []memory.Entry, budget int) error {
-	// Sort: by timestamp descending (newest first), then by type order as tiebreaker
-	sort.SliceStable(entries, func(i, j int) bool {
-		if entries[i].Timestamp != entries[j].Timestamp {
-			return entries[i].Timestamp > entries[j].Timestamp
-		}
-		return entries[i].Type.SortOrder() < entries[j].Type.SortOrder()
-	})
-
+// PrepareSnapshot partitions entries in caller-provided priority order without writing files.
+func PrepareSnapshot(entries []memory.Entry, budget int) SnapshotWriteResult {
 	now := time.Now().UTC().Format(time.RFC3339)
+	header := fmt.Sprintf("@mem v1 | %d entries | budget:%d | compacted:%s", len(entries), budget, now)
 
-	var lines []string
-	tokenCount := 0
+	result := SnapshotWriteResult{header: header}
+	tokenCount := token.Count(header + "\n\n")
 
 	for _, e := range entries {
 		line := renderEntry(e)
-		lineTokens := token.Count(line)
+		lineTokens := token.Count(line + "\n")
 		if tokenCount+lineTokens > budget {
-			break
+			result.Evicted = append(result.Evicted, e)
+			continue
 		}
-		lines = append(lines, line)
+		result.lines = append(result.lines, line)
+		result.Written = append(result.Written, e)
 		tokenCount += lineTokens
 	}
 
-	header := fmt.Sprintf("@mem v1 | %d entries | budget:%d | compacted:%s",
-		len(lines), budget, now)
-	headerTokens := token.Count(header)
+	result.header = fmt.Sprintf("@mem v1 | %d entries | budget:%d | compacted:%s",
+		len(result.lines), budget, now)
+	return result
+}
 
-	// Trim entries if header pushes over budget
-	for tokenCount+headerTokens > budget && len(lines) > 0 {
-		last := lines[len(lines)-1]
-		tokenCount -= token.Count(last)
-		lines = lines[:len(lines)-1]
-	}
-
-	// Re-render header with final count
-	header = fmt.Sprintf("@mem v1 | %d entries | budget:%d | compacted:%s",
-		len(lines), budget, now)
+// CommitSnapshot atomically replaces the canonical snapshot and compact projection.
+func CommitSnapshot(path string, result SnapshotWriteResult) error {
 
 	var sb strings.Builder
-	sb.WriteString(header)
+	sb.WriteString(result.header)
 	sb.WriteString("\n\n")
-	for _, line := range lines {
+	for _, line := range result.lines {
 		sb.WriteString(line)
 		sb.WriteString("\n")
 	}
 
-	return os.WriteFile(path, []byte(sb.String()), 0o644)
+	if err := writeCanonicalSnapshot(canonicalSnapshotPath(path), result.Written); err != nil {
+		return err
+	}
+	if err := writeFileAtomic(path, []byte(sb.String())); err != nil {
+		return err
+	}
+	return nil
+}
+
+// WriteSnapshot partitions and commits entries in one call.
+func WriteSnapshot(path string, entries []memory.Entry, budget int) (SnapshotWriteResult, error) {
+	result := PrepareSnapshot(entries, budget)
+	if err := CommitSnapshot(path, result); err != nil {
+		return SnapshotWriteResult{}, err
+	}
+	return result, nil
+}
+
+func canonicalSnapshotPath(path string) string {
+	return filepath.Join(filepath.Dir(path), SnapshotFile)
+}
+
+func readCanonicalSnapshot(path string) ([]memory.Entry, bool, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, false, nil
+		}
+		return nil, false, fmt.Errorf("open canonical snapshot: %w", err)
+	}
+	defer f.Close()
+
+	var entries []memory.Entry
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for scanner.Scan() {
+		if len(scanner.Bytes()) == 0 {
+			continue
+		}
+		var entry memory.Entry
+		if err := json.Unmarshal(scanner.Bytes(), &entry); err != nil {
+			return nil, false, fmt.Errorf("parse canonical snapshot: %w", err)
+		}
+		entries = append(entries, entry)
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, false, fmt.Errorf("scan canonical snapshot: %w", err)
+	}
+	return entries, true, nil
+}
+
+func writeCanonicalSnapshot(path string, entries []memory.Entry) error {
+	var data []byte
+	for _, entry := range entries {
+		line, err := json.Marshal(entry)
+		if err != nil {
+			return fmt.Errorf("marshal canonical snapshot: %w", err)
+		}
+		data = append(data, line...)
+		data = append(data, '\n')
+	}
+	if err := writeFileAtomic(path, data); err != nil {
+		return fmt.Errorf("write canonical snapshot: %w", err)
+	}
+	return nil
+}
+
+func writeFileAtomic(path string, data []byte) error {
+	tempFile, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".*.tmp")
+	if err != nil {
+		return err
+	}
+	tempPath := tempFile.Name()
+	defer os.Remove(tempPath)
+
+	if err := tempFile.Chmod(0o644); err != nil {
+		tempFile.Close()
+		return err
+	}
+	if _, err := tempFile.Write(data); err != nil {
+		tempFile.Close()
+		return err
+	}
+	if err := tempFile.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tempPath, path); err == nil {
+		return nil
+	}
+
+	backupFile, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".*.bak")
+	if err != nil {
+		return err
+	}
+	backupPath := backupFile.Name()
+	if err := backupFile.Close(); err != nil {
+		return err
+	}
+	if err := os.Remove(backupPath); err != nil {
+		return err
+	}
+	defer os.Remove(backupPath)
+
+	if err := os.Rename(path, backupPath); err != nil {
+		if os.IsNotExist(err) {
+			return os.Rename(tempPath, path)
+		}
+		return err
+	}
+	if err := os.Rename(tempPath, path); err != nil {
+		if restoreErr := os.Rename(backupPath, path); restoreErr != nil {
+			return fmt.Errorf("replace snapshot: %v; restore original: %w", err, restoreErr)
+		}
+		return err
+	}
+	return os.Remove(backupPath)
 }
 
 // renderEntry formats a single entry as a compact DSL line (or multi-line block for @c).

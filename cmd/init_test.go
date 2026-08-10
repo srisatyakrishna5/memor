@@ -7,6 +7,21 @@ import (
 	"testing"
 )
 
+func TestMakeInstructionsUsesEmbeddedTemplate(t *testing.T) {
+	instructions := makeInstructions()
+	expected := strings.TrimRight(strings.ReplaceAll(memorInstructionsTemplate, "\r\n", "\n"), "\n") + "\n"
+
+	if instructions != expected {
+		t.Fatal("expected makeInstructions to return the normalized embedded template")
+	}
+	if !strings.HasPrefix(instructions, "# Memor — Project Memory (MANDATORY)\n") {
+		t.Fatalf("unexpected instruction template header: %q", instructions)
+	}
+	if !strings.HasSuffix(instructions, "\n") {
+		t.Fatal("expected instruction template to end with a newline")
+	}
+}
+
 func TestUpsertMemorInstructionsAppendsToExistingContent(t *testing.T) {
 	existing := "# Existing Instructions\n\nKeep this.\n"
 	instructions := makeInstructions()

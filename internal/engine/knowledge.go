@@ -5,7 +5,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -49,8 +51,8 @@ func LoadKnowledgeDB(path string) (*KnowledgeDB, error) {
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 
-	headerRegex := regexp.MustCompile(`^@knowledge v(\S+)`)
-	docRegex := regexp.MustCompile(`^@doc\s+(\S+)\s+((?:#\S+\s*)+)\[(\d+)\s+sections?\]`)
+	headerRegex := regexp.MustCompile(`^@knowledge v(\S+)(?:.*indexed:(\S+))?`)
+	docRegex := regexp.MustCompile(`^@doc\s+(\S+)\s*((?:#\S+\s*)*)\[(\d+)\s+sections?\]$`)
 	sectionRegex := regexp.MustCompile(`^\s+::\s+(\S+):\s+(.+)$`)
 
 	var currentDoc *KnowledgeDoc
@@ -60,6 +62,9 @@ func LoadKnowledgeDB(path string) (*KnowledgeDB, error) {
 
 		if m := headerRegex.FindStringSubmatch(line); m != nil {
 			kb.Version = m[1]
+			if len(m) > 2 && m[2] != "" {
+				kb.IndexedAt, _ = time.Parse(time.RFC3339, m[2])
+			}
 			continue
 		}
 
@@ -78,6 +83,15 @@ func LoadKnowledgeDB(path string) (*KnowledgeDB, error) {
 				Name:    m[1],
 				Summary: m[2],
 			})
+			continue
+		}
+
+		if currentDoc != nil && strings.HasPrefix(line, "  source: ") {
+			currentDoc.Source = strings.TrimPrefix(line, "  source: ")
+			continue
+		}
+		if currentDoc != nil && strings.HasPrefix(line, "  hash: ") {
+			currentDoc.Hash = strings.TrimPrefix(line, "  hash: ")
 			continue
 		}
 	}
@@ -101,6 +115,12 @@ func WriteKnowledgeDB(path string, kb *KnowledgeDB) error {
 	for _, doc := range kb.Docs {
 		tags := renderSectionTags(doc.Tags)
 		sb.WriteString(fmt.Sprintf("@doc %s %s [%d sections]\n", doc.Name, tags, len(doc.Sections)))
+		if doc.Source != "" {
+			sb.WriteString(fmt.Sprintf("  source: %s\n", doc.Source))
+		}
+		if doc.Hash != "" {
+			sb.WriteString(fmt.Sprintf("  hash: %s\n", doc.Hash))
+		}
 		for _, sec := range doc.Sections {
 			sb.WriteString(fmt.Sprintf("  :: %s: %s\n", sec.Name, sec.Summary))
 		}
@@ -122,8 +142,9 @@ func IndexDocument(kb *KnowledgeDB, filePath string) error {
 
 	// Check if already indexed with same hash
 	baseName := docName(filePath)
+	cleanPath := filepath.Clean(filePath)
 	for i, doc := range kb.Docs {
-		if doc.Name == baseName {
+		if filepath.Clean(doc.Source) == cleanPath || doc.Source == "" && doc.Name == baseName {
 			if doc.Hash == hash {
 				return nil // unchanged
 			}
@@ -139,7 +160,7 @@ func IndexDocument(kb *KnowledgeDB, filePath string) error {
 	doc := KnowledgeDoc{
 		Name:     baseName,
 		Tags:     tags,
-		Source:   filePath,
+		Source:   cleanPath,
 		Hash:     hash,
 		Sections: sections,
 	}
@@ -151,21 +172,59 @@ func IndexDocument(kb *KnowledgeDB, filePath string) error {
 // ScanKnowledgePaths discovers and indexes files matching known patterns.
 func ScanKnowledgePaths(kb *KnowledgeDB, projectRoot string, patterns []string) (int, error) {
 	indexed := 0
-	for _, pattern := range patterns {
-		fullPattern := filepath.Join(projectRoot, pattern)
-		matches, err := filepath.Glob(fullPattern)
-		if err != nil {
-			continue
+	err := filepath.WalkDir(projectRoot, func(filePath string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
 		}
-		for _, match := range matches {
-			if err := IndexDocument(kb, match); err != nil {
-				fmt.Fprintf(os.Stderr, "memor: warning: could not index %s: %v\n", match, err)
+		if entry.IsDir() {
+			switch entry.Name() {
+			case ".git", ".memor", ".venv", "node_modules":
+				if filePath != projectRoot {
+					return filepath.SkipDir
+				}
+			}
+			return nil
+		}
+
+		relativePath, err := filepath.Rel(projectRoot, filePath)
+		if err != nil {
+			return err
+		}
+		relativePath = filepath.ToSlash(relativePath)
+		for _, pattern := range patterns {
+			if !matchKnowledgePath(filepath.ToSlash(pattern), relativePath) {
 				continue
 			}
+			if err := IndexDocument(kb, filePath); err != nil {
+				fmt.Fprintf(os.Stderr, "memor: warning: could not index %s: %v\n", filePath, err)
+				return nil
+			}
 			indexed++
+			break
 		}
+		return nil
+	})
+	return indexed, err
+}
+
+func matchKnowledgePath(pattern, filePath string) bool {
+	patternParts := strings.Split(strings.Trim(pattern, "/"), "/")
+	pathParts := strings.Split(strings.Trim(filePath, "/"), "/")
+	var match func(int, int) bool
+	match = func(patternIndex, pathIndex int) bool {
+		if patternIndex == len(patternParts) {
+			return pathIndex == len(pathParts)
+		}
+		if patternParts[patternIndex] == "**" {
+			return match(patternIndex+1, pathIndex) || pathIndex < len(pathParts) && match(patternIndex, pathIndex+1)
+		}
+		if pathIndex == len(pathParts) {
+			return false
+		}
+		matched, err := path.Match(patternParts[patternIndex], pathParts[pathIndex])
+		return err == nil && matched && match(patternIndex+1, pathIndex+1)
 	}
-	return indexed, nil
+	return match(0, 0)
 }
 
 // RefreshKnowledge re-indexes changed files by comparing SHA-256 hashes.

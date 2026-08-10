@@ -5,10 +5,8 @@ import (
 	"strings"
 
 	"github.com/memor-dev/memor/internal/config"
-	"github.com/memor-dev/memor/internal/index"
 	"github.com/memor-dev/memor/internal/memory"
 	"github.com/memor-dev/memor/internal/store"
-	"github.com/memor-dev/memor/internal/token"
 )
 
 // Compact merges the WAL + existing snapshot into a fresh memory.db.
@@ -34,48 +32,36 @@ func Compact(paths store.Paths, cfg config.Config) (written int, archived int, e
 	// 3. SCORE — compute relevance for each entry
 	scored := scoreEntries(combined, cfg)
 
-	// 4. BUDGET ENFORCEMENT — render within token budget
-	budget := cfg.Memory.TokenBudget
-	var kept []memory.Entry
+	// 4. DECAY — archive entries that fall below the configured threshold
+	var candidates []memory.Entry
 	var evicted []memory.Entry
-	usedTokens := 0
-
-	// Reserve tokens for header line
-	headerTokens := token.Count("@mem v1 | 999 entries | budget:9999 | compacted:2026-04-22T10:00:00Z")
-	usedTokens += headerTokens + 2 // header + blank line
-
 	for _, se := range scored {
-		line := renderCompactLine(se.Entry)
-		lineTokens := token.Count(line)
-		if usedTokens+lineTokens <= budget {
-			kept = append(kept, se.Entry)
-			usedTokens += lineTokens
-		} else {
+		if se.Score < cfg.Compaction.Decay.MinScore {
 			evicted = append(evicted, se.Entry)
+			continue
 		}
+		candidates = append(candidates, se.Entry)
 	}
 
-	// 5. WRITE
-	if err := store.WriteSnapshot(paths.MemoryDB, kept, budget); err != nil {
-		return 0, 0, fmt.Errorf("write snapshot: %w", err)
-	}
+	// 5. PARTITION — storage owns serialization and the final token-budget partition
+	result := store.PrepareSnapshot(candidates, cfg.Memory.TokenBudget)
+	evicted = append(evicted, result.Evicted...)
 
+	// 6. COMMIT — archive before replacing the active snapshot so failures are retryable
 	if len(evicted) > 0 {
 		if err := store.AppendToArchive(paths.Archive, evicted); err != nil {
 			return 0, 0, fmt.Errorf("write archive: %w", err)
 		}
+	}
+	if err := store.CommitSnapshot(paths.MemoryDB, result); err != nil {
+		return 0, 0, fmt.Errorf("write snapshot: %w", err)
 	}
 
 	if err := store.TruncateWAL(paths.MemoryWAL); err != nil {
 		return 0, 0, fmt.Errorf("truncate WAL: %w", err)
 	}
 
-	// Rebuild indexes
-	if err := rebuildIndexes(paths, kept); err != nil {
-		return len(kept), len(evicted), fmt.Errorf("rebuild indexes: %w", err)
-	}
-
-	return len(kept), len(evicted), nil
+	return len(result.Written), len(evicted), nil
 }
 
 // mergeEntries combines snapshot + WAL entries. WAL entries (newer) come last.
@@ -140,10 +126,6 @@ func scoreEntries(entries []memory.Entry, cfg config.Config) []memory.ScoredEntr
 
 		score := typeWeight * recencyDecay * (1.0 + refBoost)
 
-		if score < cfg.Compaction.Decay.MinScore {
-			continue // below threshold — will be archived
-		}
-
 		scored = append(scored, memory.ScoredEntry{Entry: e, Score: score})
 	}
 
@@ -194,28 +176,4 @@ func renderCodeEntry(e memory.Entry) string {
 		sb.WriteString(fmt.Sprintf("\n  logic: %s", m.Logic))
 	}
 	return sb.String()
-}
-
-// rebuildIndexes regenerates all index files from the given entries.
-func rebuildIndexes(paths store.Paths, entries []memory.Entry) error {
-	triIdx := index.NewTrigramIndex()
-	bloomIdx := index.NewBloomIndex()
-	tagMap := index.NewTagMap()
-	recencyRing := index.NewRecencyRing()
-
-	for i, e := range entries {
-		text := e.Content + " " + strings.Join(e.Tags, " ")
-		triIdx.Add(i, text)
-		bloomIdx.Add(text)
-		tagMap.Add(e.ID, e.Tags)
-		recencyRing.Touch(e.ID)
-	}
-
-	if err := bloomIdx.Save(paths.Bloom); err != nil {
-		return err
-	}
-	if err := tagMap.Save(paths.Tags); err != nil {
-		return err
-	}
-	return recencyRing.Save(paths.Recency)
 }

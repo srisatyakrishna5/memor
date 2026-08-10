@@ -18,33 +18,20 @@ var memorAllowedBashRules = []string{
 	"Bash(memor code *)",
 }
 
+type autoApproveTarget struct {
+	name   string
+	key    string
+	path   string
+	apply  func(string) (bool, error)
+	remove func(string) (bool, error)
+}
+
+var autoApproveTargets = []autoApproveTarget{
+	{"GitHub Copilot", "copilot", filepath.Join(".vscode", "settings.json"), mergeVSCodeAutoApprove, removeVSCodeAutoApprove},
+	{"Claude Code", "claude", filepath.Join(".claude", "settings.json"), mergeClaudePermissions, removeClaudePermissions},
+}
+
 func injectAutoApproveSettings(projectRoot string, toolsFlag string) error {
-	type autoApproveTarget struct {
-		name  string
-		key   string // first-word lowercase for filtering
-		path  string
-		apply func(fullPath string) (bool, error)
-	}
-
-	targets := []autoApproveTarget{
-		{
-			name: "GitHub Copilot",
-			key:  "copilot",
-			path: filepath.Join(".vscode", "settings.json"),
-			apply: func(fullPath string) (bool, error) {
-				return mergeVSCodeAutoApprove(fullPath)
-			},
-		},
-		{
-			name: "Claude Code",
-			key:  "claude",
-			path: filepath.Join(".claude", "settings.json"),
-			apply: func(fullPath string) (bool, error) {
-				return mergeClaudePermissions(fullPath)
-			},
-		},
-	}
-
 	requested := make(map[string]struct{})
 	if toolsFlag != "" {
 		for _, t := range strings.Split(toolsFlag, ",") {
@@ -52,7 +39,7 @@ func injectAutoApproveSettings(projectRoot string, toolsFlag string) error {
 		}
 	}
 
-	for _, t := range targets {
+	for _, t := range autoApproveTargets {
 		if toolsFlag != "" {
 			if _, ok := requested[t.key]; !ok {
 				continue
@@ -192,30 +179,7 @@ func mergeClaudePermissions(path string) (bool, error) {
 
 // removeAutoApproveSettings removes memor auto-approve entries from tool settings files.
 func removeAutoApproveSettings(projectRoot string) {
-	type removeTarget struct {
-		name   string
-		path   string
-		remove func(fullPath string) (bool, error)
-	}
-
-	targets := []removeTarget{
-		{
-			name: "GitHub Copilot",
-			path: filepath.Join(".vscode", "settings.json"),
-			remove: func(fullPath string) (bool, error) {
-				return removeVSCodeAutoApprove(fullPath)
-			},
-		},
-		{
-			name: "Claude Code",
-			path: filepath.Join(".claude", "settings.json"),
-			remove: func(fullPath string) (bool, error) {
-				return removeClaudePermissions(fullPath)
-			},
-		},
-	}
-
-	for _, t := range targets {
+	for _, t := range autoApproveTargets {
 		fullPath := filepath.Join(projectRoot, t.path)
 		if _, err := os.Stat(fullPath); os.IsNotExist(err) {
 			continue

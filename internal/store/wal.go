@@ -106,6 +106,19 @@ func TruncateWAL(walPath string) error {
 
 // AppendToArchive appends entries to the archive file.
 func AppendToArchive(archivePath string, entries []memory.Entry) error {
+	existingEntries, err := ReadWAL(archivePath)
+	if err != nil {
+		return fmt.Errorf("read archive: %w", err)
+	}
+	existingIDs := make(map[string]struct{}, len(existingEntries)+len(entries))
+	for _, entry := range existingEntries {
+		id := entry.ID
+		if id == "" {
+			id = memory.ContentID(entry.Content)
+		}
+		existingIDs[id] = struct{}{}
+	}
+
 	f, err := os.OpenFile(archivePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
 		return fmt.Errorf("open archive: %w", err)
@@ -113,6 +126,12 @@ func AppendToArchive(archivePath string, entries []memory.Entry) error {
 	defer f.Close()
 
 	for _, entry := range entries {
+		if entry.ID == "" {
+			entry.ID = memory.ContentID(entry.Content)
+		}
+		if _, exists := existingIDs[entry.ID]; exists {
+			continue
+		}
 		data, err := json.Marshal(entry)
 		if err != nil {
 			return fmt.Errorf("marshal archive entry: %w", err)
@@ -121,6 +140,7 @@ func AppendToArchive(archivePath string, entries []memory.Entry) error {
 		if _, err := f.Write(data); err != nil {
 			return fmt.Errorf("write archive: %w", err)
 		}
+		existingIDs[entry.ID] = struct{}{}
 	}
 
 	return nil

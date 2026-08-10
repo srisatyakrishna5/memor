@@ -1,10 +1,13 @@
-# @memor-dev/memor
+---
+title: npm package for Memor
+description: Install and use Memor through npm
+---
 
 **Local memory persistence for AI coding assistants.**
 
-Every AI coding tool — Copilot, Claude Code, Cursor, Windsurf — starts every conversation cold. Memor fixes that. It stores project context locally, indexes it with a full search engine, and surfaces only the relevant memories within a token budget.
+Every AI coding tool starts each conversation cold. Memor stores project context locally and surfaces relevant memories within a token budget.
 
-Five text files per project. Full indexing engine. Zero cloud, zero daemon, zero git commits.
+Local files. Ranked context. Zero cloud, zero daemon, zero git commits.
 
 ## Install
 
@@ -26,7 +29,7 @@ cd your-project
 memor init
 ```
 
-`memor init` creates `.memor/`, injects `copilot-instructions.md` and `.github/skills/memor/SKILL.md` so your AI tool automatically reads and writes memories. No extra setup needed.
+`memor init` creates `.memor/` and adds a managed instruction block to `AGENTS.md` so AI tools can read and write memories.
 
 Use `memor init --tools claude,cursor,windsurf` to configure additional AI tools.
 
@@ -62,7 +65,7 @@ Conversations ──► APPEND to memory.wal (JSONL)
 ```
 
 - **Write path**: Append memories as JSONL — fast, no coordination
-- **Read path**: Trigram index + BM25 ranking for sub-millisecond retrieval
+- **Read path**: BM25 ranking with tags, type weights, and age decay
 - **Compaction**: Deduplicates, scores, enforces token budget
 
 ## Supported Platforms

@@ -4,16 +4,18 @@
 // is read — no WAL parsing, no duplicates.
 //
 // Flags:
-//   --type    Filter by memory types (comma-separated: semantic,episodic,procedural,preference,code)
-//   --tags    Filter by tags (comma-separated)
-//   --since   Export only entries after this date (YYYY-MM-DD)
-//   -o        Output file path (default: stdout)
+//
+//	--type    Filter by memory types (comma-separated: semantic,episodic,procedural,preference,code)
+//	--tags    Filter by tags (comma-separated)
+//	--since   Export only entries after this date (YYYY-MM-DD)
+//	-o        Output file path (default: stdout)
 //
 // Examples:
-//   memor export > backup.jsonl
-//   memor export --type semantic,procedural -o decisions.jsonl
-//   memor export --tags "auth,api" > auth.jsonl
-//   memor export --since 2026-04-01 > recent.jsonl
+//
+//	memor export > backup.jsonl
+//	memor export --type semantic,procedural -o decisions.jsonl
+//	memor export --tags "auth,api" > auth.jsonl
+//	memor export --since 2026-04-01 > recent.jsonl
 package cmd
 
 import (
@@ -120,24 +122,7 @@ func runExport(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Filter entries
-	var filtered []memory.Entry
-	for _, e := range snap.Entries {
-		if len(typeFilter) > 0 {
-			if _, ok := typeFilter[e.Type]; !ok {
-				continue
-			}
-		}
-		if len(tagFilter) > 0 {
-			if !hasAnyTag(e.Tags, tagFilter) {
-				continue
-			}
-		}
-		if !sinceTime.IsZero() && e.Timestamp < sinceTime.Unix() {
-			continue
-		}
-		filtered = append(filtered, e)
-	}
+	filtered := filterExportEntries(snap.Entries, typeFilter, tagFilter, sinceTime)
 
 	if len(filtered) == 0 {
 		fmt.Fprintln(os.Stderr, "No entries match the filters.")
@@ -165,6 +150,25 @@ func runExport(cmd *cobra.Command, args []string) error {
 
 	fmt.Fprintf(os.Stderr, "Exported %d entries\n", len(filtered))
 	return nil
+}
+
+func filterExportEntries(entries []memory.Entry, types map[memory.Type]struct{}, tags map[string]struct{}, since time.Time) []memory.Entry {
+	filtered := make([]memory.Entry, 0, len(entries))
+	for _, entry := range entries {
+		if len(types) > 0 {
+			if _, ok := types[entry.Type]; !ok {
+				continue
+			}
+		}
+		if len(tags) > 0 && !hasAnyTag(entry.Tags, tags) {
+			continue
+		}
+		if !since.IsZero() && entry.Timestamp < since.Unix() {
+			continue
+		}
+		filtered = append(filtered, entry)
+	}
+	return filtered
 }
 
 // hasAnyTag returns true if the entry has at least one tag in the filter set.

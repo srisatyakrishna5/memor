@@ -4,15 +4,17 @@
 // and dry-run mode.
 //
 // Flags:
-//   --tag              Add an extra tag to all imported entries
-//   --skip-duplicates  Skip entries whose content hash already exists
-//   --dry-run          Show what would be imported without writing
+//
+//	--tag              Add an extra tag to all imported entries
+//	--skip-duplicates  Skip entries whose content hash already exists
+//	--dry-run          Show what would be imported without writing
 //
 // Examples:
-//   memor import backup.jsonl
-//   memor import decisions.jsonl --skip-duplicates
-//   memor import shared.jsonl --tag "imported"
-//   memor import backup.jsonl --dry-run
+//
+//	memor import backup.jsonl
+//	memor import decisions.jsonl --skip-duplicates
+//	memor import shared.jsonl --tag "imported"
+//	memor import backup.jsonl --dry-run
 package cmd
 
 import (
@@ -22,8 +24,6 @@ import (
 	"os"
 	"strings"
 
-	"github.com/memor-dev/memor/internal/config"
-	"github.com/memor-dev/memor/internal/engine"
 	"github.com/memor-dev/memor/internal/memory"
 	"github.com/memor-dev/memor/internal/store"
 	"github.com/spf13/cobra"
@@ -82,30 +82,7 @@ func runImport(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Filter and tag
-	var toImport []memory.Entry
-	skipped := 0
-	for _, e := range entries {
-		// Ensure ID exists
-		if e.ID == "" {
-			e.ID = memory.ContentID(e.Content)
-		}
-
-		// Skip duplicates
-		if importSkipDups {
-			if _, exists := existingIDs[e.ID]; exists {
-				skipped++
-				continue
-			}
-		}
-
-		// Add import tag
-		if importTag != "" {
-			e.Tags = append(e.Tags, strings.TrimSpace(strings.ToLower(importTag)))
-		}
-
-		toImport = append(toImport, e)
-	}
+	toImport, skipped := prepareImportEntries(entries, existingIDs, importTag)
 
 	if len(toImport) == 0 {
 		fmt.Printf("No new entries to import (%d skipped as duplicates).\n", skipped)
@@ -116,7 +93,7 @@ func runImport(cmd *cobra.Command, args []string) error {
 	if importDryRun {
 		fmt.Printf("Dry run — would import %d entries (%d skipped):\n\n", len(toImport), skipped)
 		for _, e := range toImport {
-			fmt.Printf("  %s [%s] %s: %s\n", e.Type.Prefix(), e.ID[:8], formatTagList(e.Tags), e.Content)
+			fmt.Printf("  %s [%s] %s: %s\n", e.Type.Prefix(), e.ID[:8], renderTagList(e.Tags), e.Content)
 		}
 		return nil
 	}
@@ -130,19 +107,29 @@ func runImport(cmd *cobra.Command, args []string) error {
 
 	fmt.Printf("Imported %d entries (%d skipped)\n", len(toImport), skipped)
 
-	// Auto-compact if needed
-	cfg, _ := config.Load(paths.Config)
-	walCount, _ := store.WALEntryCount(paths.MemoryWAL)
-	if walCount >= cfg.Memory.WALMaxEntries {
-		written, archived, err := engine.Compact(paths, cfg)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "memor: auto-compact failed: %v\n", err)
-		} else {
-			fmt.Printf("Auto-compacted: %d entries in snapshot, %d archived\n", written, archived)
-		}
-	}
+	maybeAutoCompact(paths)
 
 	return nil
+}
+
+func prepareImportEntries(entries []memory.Entry, existingIDs map[string]struct{}, importTag string) ([]memory.Entry, int) {
+	tag := strings.TrimSpace(strings.ToLower(importTag))
+	toImport := make([]memory.Entry, 0, len(entries))
+	skipped := 0
+	for _, entry := range entries {
+		if entry.ID == "" {
+			entry.ID = memory.ContentID(entry.Content)
+		}
+		if _, exists := existingIDs[entry.ID]; exists {
+			skipped++
+			continue
+		}
+		if tag != "" {
+			entry.Tags = append(entry.Tags, tag)
+		}
+		toImport = append(toImport, entry)
+	}
+	return toImport, skipped
 }
 
 // readJSONLFile reads memory entries from a JSONL file.
@@ -200,13 +187,4 @@ func collectExistingIDs(paths store.Paths) (map[string]struct{}, error) {
 	}
 
 	return ids, nil
-}
-
-// formatTagList renders tags for display.
-func formatTagList(tags []string) string {
-	var parts []string
-	for _, t := range tags {
-		parts = append(parts, "#"+t)
-	}
-	return strings.Join(parts, " ")
 }

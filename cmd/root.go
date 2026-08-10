@@ -13,7 +13,7 @@ var Version = "dev"
 var rootCmd = &cobra.Command{
 	Use:   "memor",
 	Short: "Local memory persistence for AI coding assistants",
-	Long: `Memor — five text files, a trigram index, and a CLI.
+	Long: `Memor — a compact local memory store and CLI.
 It sits in .memor/ inside your project (gitignored), learns from every conversation,
 indexes your skills and instructions, and gives every AI tool exactly the right
 context — within a token budget — at the start of every conversation.`,

@@ -17,20 +17,11 @@ func TestDefault(t *testing.T) {
 	if cfg.Memory.WALMaxEntries != constants.DefaultWALMaxEntries {
 		t.Errorf("expected wal_max_entries %d, got %d", constants.DefaultWALMaxEntries, cfg.Memory.WALMaxEntries)
 	}
-	if cfg.Memory.ArchiveAfterDays != constants.DefaultArchiveAfterDays {
-		t.Errorf("expected archive_after_days %d, got %d", constants.DefaultArchiveAfterDays, cfg.Memory.ArchiveAfterDays)
-	}
-	if cfg.Compaction.Strategy != "relevance_scored" {
-		t.Errorf("expected strategy relevance_scored, got %s", cfg.Compaction.Strategy)
-	}
 	if cfg.Compaction.TypeWeights.Preference != 1.0 {
 		t.Errorf("expected preference weight 1.0, got %f", cfg.Compaction.TypeWeights.Preference)
 	}
 	if cfg.Knowledge.Enabled != true {
 		t.Error("expected knowledge enabled by default")
-	}
-	if cfg.Hooks.PreCommit != true {
-		t.Error("expected pre_commit hook enabled by default")
 	}
 }
 
@@ -57,9 +48,8 @@ func TestSaveAndLoad(t *testing.T) {
 	if loaded.Memory.WALMaxEntries != 50 {
 		t.Errorf("expected wal_max_entries 50, got %d", loaded.Memory.WALMaxEntries)
 	}
-	// Fields not set should retain defaults from TOML unmarshalling
-	if loaded.Compaction.Strategy != "relevance_scored" {
-		t.Errorf("expected strategy preserved, got %s", loaded.Compaction.Strategy)
+	if loaded.Compaction.TypeWeights.Semantic != constants.WeightSemantic {
+		t.Errorf("expected semantic weight preserved, got %f", loaded.Compaction.TypeWeights.Semantic)
 	}
 }
 

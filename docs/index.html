@@ -120,12 +120,7 @@
     <div class="section-inner">
       <div class="section-eyebrow">Architecture</div>
       <h2 class="section-title">How Memor works</h2>
-      <p class="section-subtitle">An LSM-tree-inspired pipeline: instant writes, ranked reads, sub-millisecond retrieval.</p>
-
-      <!-- Featured architecture diagram -->
-      <div class="arch-diagram">
-        <img src="assets/memor.png" alt="Memor architecture — from AI coding assistants through WAL, compaction engine, trigram+BM25 indexing, to compact snapshot" loading="lazy">
-      </div>
+      <p class="section-subtitle">An LSM-tree-inspired pipeline: append-only writes, lossless compaction, and ranked reads.</p>
 
       <div class="arch-steps">
         <div class="arch-step">
@@ -151,8 +146,8 @@
             <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg>
           </div>
           <div class="arch-content">
-            <h3>Read <span class="latency">&lt; 1ms</span></h3>
-            <p><code>memor context</code> retrieves ranked memories within budget — trigram index + BM25, sub-millisecond.</p>
+            <h3>Read <span class="latency">on demand</span></h3>
+            <p><code>memor context</code> ranks memories with BM25, tags, type weights, and age decay.</p>
           </div>
         </div>
       </div>
@@ -163,8 +158,8 @@
           <div class="stat-label">Per-project footprint</div>
         </div>
         <div class="stat">
-          <div class="stat-value">&lt; 1 ms</div>
-          <div class="stat-label">Retrieval latency</div>
+          <div class="stat-value">1</div>
+          <div class="stat-label">Canonical compacted store</div>
         </div>
         <div class="stat">
           <div class="stat-value">51%</div>
@@ -222,7 +217,7 @@
         <div class="memory-card episodic">
           <div class="memory-prefix">@e</div>
           <h3>Episodic</h3>
-          <p>Events and bugs fixed. Fades over time — archived after 90 days.</p>
+          <p>Events and bugs fixed. Lower weight means stale events fade sooner.</p>
           <div class="memory-meta">Weight: 0.5 &middot; Decay: fast</div>
           <div class="memory-example">
             <code>@e #fix: N+1 query in dashboard loader</code>
@@ -240,7 +235,7 @@
         <div class="memory-card preference">
           <div class="memory-prefix">@f</div>
           <h3>Preference</h3>
-          <p>Style conventions and developer preferences. Permanent — never archived.</p>
+          <p>Style conventions and developer preferences. Highest ranking weight.</p>
           <div class="memory-meta">Weight: 0.9 &middot; Decay: none</div>
           <div class="memory-example">
             <code>@f #ts: No any, use unknown + type guards</code>
@@ -281,7 +276,7 @@
         </div>
         <div class="cli-item">
           <code class="cli-cmd">memor search &lt;query&gt;</code>
-          <span class="cli-desc">Full-text search with trigram + BM25</span>
+          <span class="cli-desc">Keyword search with BM25 ranking</span>
         </div>
         <div class="cli-item">
           <code class="cli-cmd">memor compact</code>
@@ -289,7 +284,7 @@
         </div>
         <div class="cli-item">
           <code class="cli-cmd">memor stats</code>
-          <span class="cli-desc">Entry counts, token usage, index health</span>
+          <span class="cli-desc">Entry counts, token usage, file sizes</span>
         </div>
         <div class="cli-item">
           <code class="cli-cmd">memor reinforce &lt;id&gt;</code>
@@ -341,7 +336,7 @@
   <section class="section cta-section">
     <div class="section-inner">
       <h2 class="cta-title"><span class="gradient-text">Give your agent a memory.</span></h2>
-      <p class="cta-sub">Five files per project. Full indexing engine. Zero cloud. Zero config.</p>
+      <p class="cta-sub">Local files. Ranked context. Zero cloud. Zero daemon.</p>
       <div class="hero-actions">
         <a href="https://github.com/akashchekka/memor" class="btn btn-primary" target="_blank" rel="noopener">
           <span class="btn-icon">▸</span> View on GitHub

@@ -1,21 +1,22 @@
 // reinforce.go — memor reinforce
 //
-// Bumps a memory's relevance by moving it to the front of the recency ring.
+// Bumps a memory's relevance by refreshing its timestamp in the WAL.
 // Useful when the AI or developer references a memory and wants to keep it from
 // being archived during compaction.
 //
 // Args: memory ID (required)
 //
 // Examples:
-//   memor reinforce 0a3f9c2b1e7d
-//   memor reinforce b4e1a7c3d9f2
+//
+//	memor reinforce 0a3f9c2b1e7d
+//	memor reinforce b4e1a7c3d9f2
 package cmd
 
 import (
 	"fmt"
 	"os"
+	"time"
 
-	"github.com/memor-dev/memor/internal/index"
 	"github.com/memor-dev/memor/internal/store"
 	"github.com/spf13/cobra"
 )
@@ -39,19 +40,36 @@ func runReinforce(cmd *cobra.Command, args []string) error {
 	}
 
 	id := args[0]
-
-	// Update recency ring
-	recency := index.NewRecencyRing()
-	if err := recency.Load(paths.Recency); err != nil {
-		return fmt.Errorf("load recency ring: %w", err)
+	if err := reinforceMemory(paths, id, time.Now().Unix()); err != nil {
+		return err
 	}
 
-	recency.Touch(id)
-
-	if err := recency.Save(paths.Recency); err != nil {
-		return fmt.Errorf("save recency ring: %w", err)
-	}
-
-	fmt.Printf("Reinforced memory %s (moved to front of recency ring)\n", id)
+	fmt.Printf("Reinforced memory %s\n", id)
 	return nil
+}
+
+func reinforceMemory(paths store.Paths, id string, timestamp int64) error {
+	snapshot, err := store.ReadSnapshot(paths.MemoryDB)
+	if err != nil {
+		return fmt.Errorf("read snapshot: %w", err)
+	}
+	walEntries, err := store.ReadWAL(paths.MemoryWAL)
+	if err != nil {
+		return fmt.Errorf("read WAL: %w", err)
+	}
+
+	entries := append(snapshot.Entries, walEntries...)
+	for i := len(entries) - 1; i >= 0; i-- {
+		if entries[i].ID != id {
+			continue
+		}
+		entry := entries[i]
+		entry.Timestamp = timestamp
+		if err := store.AppendToWAL(paths.MemoryWAL, entry); err != nil {
+			return fmt.Errorf("write reinforced memory: %w", err)
+		}
+		return nil
+	}
+
+	return fmt.Errorf("memory %s not found", id)
 }

@@ -121,7 +121,7 @@ type CodeMeta struct {
 
 // IsExpired returns true if the entry has a set expiry that has passed.
 func (e *Entry) IsExpired() bool {
-	if e.Expires == 0 {
+	if e.Expires <= 0 {
 		return false
 	}
 	return time.Now().Unix() > e.Expires

@@ -5,11 +5,13 @@
 // the token budget, and archives entries that don't fit.
 //
 // Flags:
-//   --if-needed   Only run if WAL exceeds wal_max_entries threshold from config
+//
+//	--if-needed   Only run if WAL exceeds wal_max_entries threshold from config
 //
 // Examples:
-//   memor compact
-//   memor compact --if-needed
+//
+//	memor compact
+//	memor compact --if-needed
 package cmd
 
 import (
@@ -68,4 +70,26 @@ func runCompact(cmd *cobra.Command, args []string) error {
 
 	fmt.Printf("Compaction complete: %d entries in snapshot, %d archived\n", written, archived)
 	return nil
+}
+
+func maybeAutoCompact(paths store.Paths) {
+	cfg, err := config.Load(paths.Config)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "memor: auto-compact skipped: load config: %v\n", err)
+		return
+	}
+	count, err := store.WALEntryCount(paths.MemoryWAL)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "memor: auto-compact skipped: count WAL entries: %v\n", err)
+		return
+	}
+	if count < cfg.Memory.WALMaxEntries {
+		return
+	}
+	written, archived, err := engine.Compact(paths, cfg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "memor: auto-compact failed: %v\n", err)
+		return
+	}
+	fmt.Printf("Auto-compacted: %d entries in snapshot, %d archived\n", written, archived)
 }

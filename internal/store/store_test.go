@@ -3,6 +3,7 @@ package store
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
@@ -110,6 +111,26 @@ func TestWALEntryCount(t *testing.T) {
 	}
 }
 
+func TestAppendToArchiveSkipsDuplicateIDs(t *testing.T) {
+	archivePath := filepath.Join(t.TempDir(), "memory.archive")
+	entry := memory.Entry{ID: "same-id", Type: memory.TypeSemantic, Content: "same content"}
+
+	if err := AppendToArchive(archivePath, []memory.Entry{entry, entry}); err != nil {
+		t.Fatal(err)
+	}
+	if err := AppendToArchive(archivePath, []memory.Entry{entry}); err != nil {
+		t.Fatal(err)
+	}
+
+	entries, err := ReadWAL(archivePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected one archived copy, got %d", len(entries))
+	}
+}
+
 func TestWriteAndReadSnapshot(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "memory.db")
@@ -120,7 +141,7 @@ func TestWriteAndReadSnapshot(t *testing.T) {
 		{Type: memory.TypePreference, Tags: []string{"typescript"}, Content: "no any types", Expires: -1},
 	}
 
-	if err := WriteSnapshot(dbPath, entries, 10000); err != nil {
+	if _, err := WriteSnapshot(dbPath, entries, 10000); err != nil {
 		t.Fatalf("WriteSnapshot failed: %v", err)
 	}
 
@@ -138,6 +159,46 @@ func TestWriteAndReadSnapshot(t *testing.T) {
 		if e.Type == memory.TypePreference && e.Expires != -1 {
 			t.Error("expected preference to have perm marker")
 		}
+	}
+}
+
+func TestWriteAndReadSnapshotPreservesEntryFields(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "memory.db")
+	entry := memory.Entry{
+		Timestamp:  time.Date(2026, 3, 1, 14, 30, 0, 0, time.UTC).Unix(),
+		Type:       memory.TypeCode,
+		ID:         "entry-id",
+		Tags:       []string{"engine", "storage"},
+		Content:    "internal/store/snapshot.go",
+		Author:     "copilot",
+		Session:    "session-id",
+		Expires:    time.Date(2027, 3, 1, 0, 0, 0, 0, time.UTC).Unix(),
+		Supersedes: "previous-id",
+		Meta: &memory.CodeMeta{
+			FilePath: "internal/store/snapshot.go",
+			LOC:      300,
+			Hash:     "abcdef123456",
+			Exports:  []string{"ReadSnapshot", "WriteSnapshot"},
+			Deps:     []string{"memory", "token"},
+			Summary:  "Persists snapshots.",
+			Patterns: "JSONL canonical store",
+			Logic:    "read -> parse -> return",
+		},
+	}
+
+	if _, err := WriteSnapshot(dbPath, []memory.Entry{entry}, 10000); err != nil {
+		t.Fatalf("WriteSnapshot failed: %v", err)
+	}
+
+	snapshot, err := ReadSnapshot(dbPath)
+	if err != nil {
+		t.Fatalf("ReadSnapshot failed: %v", err)
+	}
+	if len(snapshot.Entries) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(snapshot.Entries))
+	}
+	if !reflect.DeepEqual(snapshot.Entries[0], entry) {
+		t.Errorf("snapshot entry changed during round trip\nwant: %#v\n got: %#v", entry, snapshot.Entries[0])
 	}
 }
 
@@ -170,8 +231,12 @@ func TestSnapshotTokenBudget(t *testing.T) {
 	}
 
 	budget := 200
-	if err := WriteSnapshot(dbPath, entries, budget); err != nil {
+	result, err := WriteSnapshot(dbPath, entries, budget)
+	if err != nil {
 		t.Fatalf("WriteSnapshot failed: %v", err)
+	}
+	if len(result.Written)+len(result.Evicted) != len(entries) {
+		t.Fatalf("snapshot partition lost entries: wrote %d, evicted %d", len(result.Written), len(result.Evicted))
 	}
 
 	snap, err := ReadSnapshot(dbPath)
@@ -200,9 +265,6 @@ func TestResolvePaths(t *testing.T) {
 	if paths.Config != filepath.Join("/project", ".memor", "config.toml") {
 		t.Errorf("unexpected Config: %s", paths.Config)
 	}
-	if paths.Bloom != filepath.Join("/project", ".memor", "index", "bloom.bin") {
-		t.Errorf("unexpected Bloom: %s", paths.Bloom)
-	}
 }
 
 func TestEnsureDirs(t *testing.T) {
@@ -217,12 +279,4 @@ func TestEnsureDirs(t *testing.T) {
 		t.Error("expected .memor/ to exist after EnsureDirs")
 	}
 
-	// Index dir should also exist
-	info, err := os.Stat(paths.Index)
-	if err != nil {
-		t.Fatalf("index dir missing: %v", err)
-	}
-	if !info.IsDir() {
-		t.Error("expected index to be a directory")
-	}
 }

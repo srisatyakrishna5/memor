@@ -1,13 +1,11 @@
 // Package constants defines all shared constants used across memor.
-// Centralizing constants prevents drift between config defaults,
-// init templates, tests, and index parameters.
+// Centralizing constants prevents drift between config defaults and tests.
 package constants
 
 // Memory defaults
 const (
-	DefaultTokenBudget      = 15000
-	DefaultWALMaxEntries    = 2
-	DefaultArchiveAfterDays = 90
+	DefaultTokenBudget   = 15000
+	DefaultWALMaxEntries = 2
 )
 
 // Compaction weights
@@ -23,13 +21,6 @@ const (
 const (
 	DefaultDecayRate     = 0.03
 	DefaultDecayMinScore = 0.1
-)
-
-// Index parameters
-const (
-	BloomExpectedItems = 10000
-	BloomFPRate        = 0.01
-	RecencyRingSize    = 256
 )
 
 // Content hashing

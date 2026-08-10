@@ -2,7 +2,6 @@ package index
 
 import (
 	"math"
-	"sort"
 	"strings"
 )
 
@@ -100,21 +99,4 @@ func (s *BM25Scorer) docFreq(term string) int {
 		}
 	}
 	return count
-}
-
-// RankedResult holds a document index and its combined score.
-type RankedResult struct {
-	Index int
-	Score float64
-}
-
-// Rank returns document indices sorted by score descending, limited to top N.
-func Rank(scores []RankedResult, topN int) []RankedResult {
-	sort.Slice(scores, func(i, j int) bool {
-		return scores[i].Score > scores[j].Score
-	})
-	if topN > 0 && len(scores) > topN {
-		scores = scores[:topN]
-	}
-	return scores
 }

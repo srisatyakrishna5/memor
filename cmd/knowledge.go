@@ -4,21 +4,24 @@
 // files into section-level chunks for retrieval.
 //
 // Subcommands:
-//   add      Index a specific document into the knowledge base
-//   scan     Auto-discover and index all known file patterns
-//   refresh  Re-index files that changed since last scan
-//   list     Show indexed documents and sections
+//
+//	add      Index a specific document into the knowledge base
+//	scan     Auto-discover and index all known file patterns
+//	refresh  Re-index files that changed since last scan
+//	list     Show indexed documents and sections
 //
 // Examples:
-//   memor knowledge add ./docs/runbook.md
-//   memor knowledge scan
-//   memor knowledge refresh
-//   memor knowledge list
+//
+//	memor knowledge add ./docs/runbook.md
+//	memor knowledge scan
+//	memor knowledge refresh
+//	memor knowledge list
 package cmd
 
 import (
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/memor-dev/memor/internal/config"
 	"github.com/memor-dev/memor/internal/engine"
@@ -185,7 +188,7 @@ func runKnowledgeList(cmd *cobra.Command, args []string) error {
 			for i, t := range doc.Tags {
 				tagParts[i] = "#" + t
 			}
-			tags = " " + joinStrings(tagParts, " ")
+			tags = " " + strings.Join(tagParts, " ")
 		}
 		fmt.Printf("@doc %s%s [%d sections]\n", doc.Name, tags, len(doc.Sections))
 		for _, sec := range doc.Sections {
@@ -195,15 +198,4 @@ func runKnowledgeList(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
-}
-
-func joinStrings(parts []string, sep string) string {
-	result := ""
-	for i, p := range parts {
-		if i > 0 {
-			result += sep
-		}
-		result += p
-	}
-	return result
 }

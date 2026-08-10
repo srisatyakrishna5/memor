@@ -8,16 +8,15 @@
 // Flags:
 //
 //	--tools      Comma-separated tools to configure: copilot,claude,cursor,windsurf
-//	--reinject   Update existing skill files to latest template
 //
 // Examples:
 //
 //	memor init
 //	memor init --tools copilot,claude,cursor
-//	memor init --reinject
 package cmd
 
 import (
+	_ "embed"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -30,7 +29,6 @@ import (
 )
 
 var initTools string
-var initReinject bool
 
 var initCmd = &cobra.Command{
 	Use:   "init",
@@ -41,7 +39,6 @@ var initCmd = &cobra.Command{
 
 func init() {
 	initCmd.Flags().StringVar(&initTools, "tools", "", "Comma-separated tools to configure: copilot,claude,cursor,windsurf")
-	initCmd.Flags().BoolVar(&initReinject, "reinject", false, "Update injected instructions to latest template")
 }
 
 func runInit(cmd *cobra.Command, args []string) error {
@@ -93,7 +90,7 @@ func runInit(cmd *cobra.Command, args []string) error {
 	}
 
 	// Inject into AI tool configs
-	if err := injectToolConfigs(cwd, initTools, initReinject); err != nil {
+	if err := injectToolConfigs(cwd, initTools); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: could not inject tool configs: %v\n", err)
 	}
 
@@ -191,35 +188,12 @@ const (
 	memorInstructionsEnd   = "<!-- END MEMOR INSTRUCTIONS -->"
 )
 
+//go:embed templates/memor-instructions.md.tmpl
+var memorInstructionsTemplate string
+
 func makeInstructions() string {
-	return `# Memor — Project Memory (MANDATORY)
-
-This project uses [memor](https://github.com/akashchekka/memor) for persistent AI memory.
-You MUST follow these rules. Skipping any step is a violation.
-
-**Command timing (read this first):**
-- **Before the conversation starts:** only ` + "`memor context`" + ` runs.
-- **Before reading a source file (mid-turn):** ` + "`memor code load <file>`" + ` is the sole exception — it's a read-only cache check that prevents redundant file reads.
-- **After your response (end of turn):** all writes — ` + "`memor add`" + `, ` + "`memor code save`" + ` — run as the final tool calls of the turn.
-
-## RULE 1: At the start of a new conversation
-You MUST run ` + "`memor context`" + ` in the terminal before any other tool call. This applies only to the first user message of a conversation, not every turn.
-
-## RULE 2: At the end of every turn
-After producing your response, and as the final tool calls of the turn, write 2-3 sentences capturing the decision, reasoning, and rejected alternatives. You MUST run one of:
-- ` + "`memor add -s \"#tag: summary\"`" + ` — decisions, facts, architecture
-- ` + "`memor add --type episodic -s \"#tag: summary\"`" + ` — bugs fixed, events
-- ` + "`memor add --type procedural -s \"#tag: summary\"`" + ` — commands, workflows
-- ` + "`memor add --type preference -s \"#tag: summary\"`" + ` — style conventions
-
-## RULE 3: Around any source file read or write
-- **Before reading a file**, ALWAYS check first: ` + "`memor code load <file>`" + ` — skip the read if the cached summary is fresh.
-- **After reading or writing a file** (as part of the end-of-turn writes in Rule 2), run: ` + "`memor code save <file> --exports \"...\" --summary \"...\"`" + `
-- For complex files, optionally add logic: ` + "`memor code save <file> --logic \"step → step\"`" + `
-
-## RULE 4: NEVER edit .memor/ files
-ALWAYS use the ` + "`memor`" + ` CLI. NEVER use file-editing tools on ` + "`.memor/`" + ` files.
-`
+	normalized := strings.ReplaceAll(memorInstructionsTemplate, "\r\n", "\n")
+	return strings.TrimRight(normalized, "\n") + "\n"
 }
 
 func wrapMemorInstructions(instructions string) string {
@@ -362,7 +336,7 @@ func getToolInstructionFiles() []toolInstructionFile {
 	}
 }
 
-func injectToolConfigs(projectRoot string, toolsFlag string, reinject bool) error {
+func injectToolConfigs(projectRoot string, toolsFlag string) error {
 	files := getToolInstructionFiles()
 
 	// If specific tools requested, filter
@@ -393,9 +367,7 @@ func injectToolConfigs(projectRoot string, toolsFlag string, reinject bool) erro
 		if changed, err := writeMemorInstructionsFile(fullPath, inf.content); err != nil {
 			return err
 		} else if changed {
-			if reinject {
-				fmt.Printf("Updated %s\n", inf.path)
-			} else if existed {
+			if existed {
 				fmt.Printf("Updated %s\n", inf.path)
 			} else {
 				fmt.Printf("Created %s\n", inf.path)

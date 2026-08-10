@@ -5,15 +5,17 @@
 // understand code without re-reading files.
 //
 // Subcommands:
-//   save   Save a code file summary (exports, deps, summary, patterns)
-//   load   Load summaries by file path or query
-//   list   List all mapped files
+//
+//	save   Save a code file summary (exports, deps, summary, patterns)
+//	load   Load summaries by file path or query
+//	list   List all mapped files
 //
 // Examples:
-//   memor code save src/lib/auth.ts --exports "refreshToken(), validate()" --summary "Auth middleware"
-//   memor code load src/lib/auth.ts
-//   memor code load --query "auth"
-//   memor code list
+//
+//	memor code save src/lib/auth.ts --exports "refreshToken(), validate()" --summary "Auth middleware"
+//	memor code load src/lib/auth.ts
+//	memor code load --query "auth"
+//	memor code list
 package cmd
 
 import (
@@ -27,8 +29,6 @@ import (
 	"time"
 
 	"github.com/memor-dev/memor/internal/constants"
-	"github.com/memor-dev/memor/internal/config"
-	"github.com/memor-dev/memor/internal/engine"
 	"github.com/memor-dev/memor/internal/memory"
 	"github.com/memor-dev/memor/internal/store"
 	"github.com/spf13/cobra"
@@ -164,17 +164,7 @@ func runCodeSave(cmd *cobra.Command, args []string) error {
 
 	fmt.Printf("Saved code summary [%s]: %s [%d LOC | %s]\n", entry.ID[:8], filePath, loc, hash)
 
-	// Auto-compact if needed
-	cfg, _ := config.Load(paths.Config)
-	walCount, _ := store.WALEntryCount(paths.MemoryWAL)
-	if walCount >= cfg.Memory.WALMaxEntries {
-		written, archived, err := engine.Compact(paths, cfg)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "memor: auto-compact failed: %v\n", err)
-		} else {
-			fmt.Printf("Auto-compacted: %d entries in snapshot, %d archived\n", written, archived)
-		}
-	}
+	maybeAutoCompact(paths)
 
 	return nil
 }

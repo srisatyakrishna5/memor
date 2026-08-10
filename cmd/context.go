@@ -4,13 +4,15 @@
 // knowledge sections within a token budget. Outputs a ready-to-inject context block.
 //
 // Flags:
-//   --budget   Override token budget from config.toml
-//   --query    Filter by relevance to a specific task
+//
+//	--budget   Override token budget from config.toml
+//	--query    Filter by relevance to a specific task
 //
 // Examples:
-//   memor context
-//   memor context --query "fix flaky auth test"
-//   memor context --budget 5000 --query "deploy api"
+//
+//	memor context
+//	memor context --query "fix flaky auth test"
+//	memor context --budget 5000 --query "deploy api"
 package cmd
 
 import (

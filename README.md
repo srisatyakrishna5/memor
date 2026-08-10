@@ -1,6 +1,7 @@
-<p align="center">
-  <img src="assets/memor.png" alt="Memor Architecture" width="800">
-</p>
+---
+title: Memor
+description: Local memory persistence for AI coding assistants
+---
 
 <h1 align="center">Memor</h1>
 
@@ -17,11 +18,11 @@
 </p>
 
 <p align="center">
-  Every AI coding tool — Copilot, Claude Code, Cursor, Windsurf, Aider — starts every conversation cold, with zero knowledge of past decisions. Memor fixes that. It stores project context locally, indexes it with a full search engine, and gives every tool exactly the right memories within a token budget at conversation start.
+  Every AI coding tool starts each conversation cold, with zero knowledge of past decisions. Memor stores project context locally and gives every tool relevant memories within a token budget at conversation start.
 </p>
 
 <p align="center">
-  <em>Five text files per project. Full indexing engine. Zero cloud, zero daemon, zero git commits.</em>
+  <em>Local files. Ranked context. Zero cloud, zero daemon, zero git commits.</em>
 </p>
 
 ---
@@ -40,7 +41,7 @@
 ## How It Works
 
 - **Write path**: AI tools append memories as JSONL lines to `memory.wal` — fast, append-only, no coordination.
-- **Read path**: `memor context` retrieves the most relevant memories + knowledge sections within a token budget — powered by trigram index + BM25 ranking for sub-millisecond retrieval.
+- **Read path**: `memor context` ranks memories and knowledge sections with BM25, tags, type weights, and age decay.
 - **Compaction**: Periodically merges the WAL into `memory.db`, deduplicates via SHA-256 content hashing, scores by relevance, and enforces the token budget.
 
 ---
@@ -64,7 +65,7 @@ cd your-project
 memor init
 ```
 
-This creates `.memor/`, injects `copilot-instructions.md` and `.github/skills/memor/SKILL.md` so your AI tool automatically reads and writes memories, installs a pre-commit safety hook, and adds `.memor/` to `.gitignore`. No extra setup needed.
+This creates `.memor/`, adds Memor instructions to `AGENTS.md`, installs a best-effort compaction hook, and adds `.memor/` to `.gitignore`.
 
 Use `memor init --tools claude,cursor,windsurf` to configure additional AI tools.
 
@@ -100,15 +101,11 @@ memor query --tags "auth,api"
 <project>/
 ├── .memor/                       # Per-project memory (gitignored)
 │   ├── memory.db                 # Token-optimized snapshot (compact DSL)
+│   ├── memory.snapshot.jsonl     # Lossless canonical compacted entries
 │   ├── memory.wal                # JSONL append-only write log
 │   ├── memory.archive            # Evicted entries (cold storage)
 │   ├── knowledge.db              # Indexed skills & instructions
-│   ├── config.toml               # Configuration
-│   └── index/                    # Derived indexes (regeneratable)
-│       ├── trigrams.bin
-│       ├── tags.json
-│       ├── bloom.bin
-│       └── recency.json
+│   └── config.toml               # Configuration
 └── .gitignore
 ```
 
@@ -160,12 +157,11 @@ memor query --tags "auth,api"
 | `memor init` | Initialize `.memor/` in the current project, set up hooks and skill files |
 | `memor add` | Append a new memory to the WAL |
 | `memor context` | Get relevant context within a token budget (the main agent entry point) |
-| `memor search <query>` | Full-text search memories by keyword (trigram + BM25) |
+| `memor search <query>` | Search memories by keyword with BM25 ranking |
 | `memor query --tags <t>` | Filter memories by tags |
 | `memor compact` | Merge WAL into `memory.db` snapshot |
-| `memor stats` | Show entry counts, token usage, and index health |
+| `memor stats` | Show entry counts, token usage, and file sizes |
 | `memor reinforce <id>` | Bump relevance of a useful memory |
-| `memor rebuild` | Rebuild all indexes from WAL + archive |
 | `memor code save <file>` | Save a structured code file summary (exports, deps, summary, logic) |
 | `memor code load [file]` | Load code summaries by path or `--query`, shows fresh/stale/missing |
 | `memor code list` | List all mapped code files |
@@ -180,32 +176,30 @@ memor query --tags "auth,api"
 
 ---
 
-## Indexing Engine
+## Retrieval
 
-Memor combines well-known algorithms for sub-millisecond retrieval without embeddings, vector databases, or network calls:
+Memor ranks the bounded active memory set without embeddings, vector databases, or network calls:
 
-- **Trigram inverted index** — decomposes content into 3-character substrings for fast candidate matching (same approach as Google Code Search)
-- **BM25 ranking** — probabilistic relevance scoring with TF-IDF, used by Elasticsearch and Lucene
-- **Bloom filter** — instant negative lookups at 1% false-positive rate (~12 KB for 10K entries)
-- **Recency ring** — LRU buffer that boosts recently accessed memories
+- **BM25 ranking** — probabilistic keyword relevance scoring
+- **Inline tag overlap** — explicit topic matches without a side index
+- **Type weights and age decay** — stable preference and freshness signals
 - **Content-addressed dedup** — SHA-256 hashing ensures identical facts produce one entry regardless of source
 
 ---
 
 ## AI Tool Integration
 
-Memor is tool-agnostic. `memor init` copies the memor SKILL.md into each tool's skills directory:
+Memor is tool-agnostic. `memor init` manages a marked instruction block in each tool's project instruction file:
 
-| Tool | Skill Location |
+| Tool | Instruction File |
 |---|---|
-| GitHub Copilot | `.github/skills/memor/SKILL.md` |
-| Claude Code | `.claude/skills/memor/SKILL.md` |
-| Cursor | `.cursor/skills/memor/SKILL.md` |
-| Windsurf | `.windsurf/skills/memor/SKILL.md` |
+| GitHub Copilot | `AGENTS.md` |
+| Cursor | `.cursorrules` |
+| Windsurf | `.windsurfrules` |
 
-By default, only the Copilot skill is created. Use `memor init --tools claude,cursor,windsurf` to create skills for other tools.
+By default, only `AGENTS.md` is configured. Use `memor init --tools cursor,windsurf` to configure additional instruction files. Claude terminal permissions can be configured with `--tools claude`.
 
-At conversation start, the AI tool reads `.memor/memory.db` for project context. After every response, it saves memories using `memor add`.
+At conversation start, the AI tool runs `memor context` for ranked project context. After every response, it saves memories using `memor add`.
 
 ---
 
@@ -216,12 +210,11 @@ At conversation start, the AI tool reads `.memor/memory.db` for project context.
 ```toml
 [memory]
 token_budget = 15000         # Max tokens for memory.db
-wal_max_entries = 100        # Auto-compact threshold
+wal_max_entries = 2          # Auto-compact threshold
 
-[ranking]
-recency_weight = 0.3         # Freshness boost
-bm25_k1 = 1.2                # Term frequency saturation
-bm25_b = 0.75                # Length normalization
+[compaction.decay]
+rate = 0.03                  # Age decay per day
+min_score = 0.1              # Archive threshold
 ```
 
 ---
@@ -230,11 +223,14 @@ bm25_b = 0.75                # Length normalization
 
 1. **Local-first, no infrastructure** — just files on disk
 2. **Text-first agent interface** — plain UTF-8, readable by any AI tool
-3. **Full indexing engine** — trigram + BM25 + Bloom for sub-ms retrieval
+3. **Transparent ranking** — BM25 plus tags, type weights, and age decay
 4. **Token-budget-aware** — never exceeds the configured budget
 5. **Tool-agnostic** — works with any AI coding assistant
 6. **Append-only writes, compacted reads** — LSM-tree inspired architecture
 7. **Zero-config start** — `memor init` and done
+
+The complete architecture, data flow, scoring, persistence, and recovery model
+is documented in [CONCEPTS.md](CONCEPTS.md).
 
 ---
 
@@ -266,7 +262,7 @@ internal/
   config/            # config.toml parsing
   constants/         # Centralized constants
   engine/            # Compaction, context retrieval, knowledge indexing
-  index/             # Trigram, BM25, Bloom filter, recency ring
+  index/             # BM25 scoring
   memory/            # Memory entry types (including CodeMeta)
   store/             # WAL, snapshot, paths
   token/             # Token counting
@@ -285,7 +281,6 @@ internal/
 
 - **Go 1.23** — single static binary, no runtime dependencies
 - **Cobra** — CLI framework
-- **Bloom filter** — `bits-and-blooms/bloom`
 - **TOML** — `pelletier/go-toml`
 
 ---
@@ -294,7 +289,7 @@ internal/
 
 - All data stays local — no cloud, no telemetry, no network calls
 - `.memor/` is gitignored by default — never committed
-- Pre-commit hook prevents accidental commits of `.memor/`
+- `.gitignore` prevents accidental commits of `.memor/`
 - Never store secrets, API keys, passwords, or PII in memories
 
 ---

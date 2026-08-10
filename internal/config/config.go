@@ -13,24 +13,18 @@ type Config struct {
 	Memory     MemoryConfig     `toml:"memory"`
 	Compaction CompactionConfig `toml:"compaction"`
 	Knowledge  KnowledgeConfig  `toml:"knowledge"`
-	Hooks      HooksConfig      `toml:"hooks"`
 }
 
 // MemoryConfig holds memory budget and WAL settings.
 type MemoryConfig struct {
-	SchemaVersion    string `toml:"schema_version"`
-	TokenBudget      int    `toml:"token_budget"`
-	WALMaxEntries    int    `toml:"wal_max_entries"`
-	ArchiveAfterDays int    `toml:"archive_after_days"`
+	TokenBudget   int `toml:"token_budget"`
+	WALMaxEntries int `toml:"wal_max_entries"`
 }
 
 // CompactionConfig holds compaction strategy and weights.
 type CompactionConfig struct {
-	Strategy      string                `toml:"strategy"`
-	PreserveTypes []string              `toml:"preserve_types"`
-	DecayTypes    []string              `toml:"decay_types"`
-	TypeWeights   CompactionTypeWeights `toml:"type_weights"`
-	Decay         DecayConfig           `toml:"decay"`
+	TypeWeights CompactionTypeWeights `toml:"type_weights"`
+	Decay       DecayConfig           `toml:"decay"`
 }
 
 // CompactionTypeWeights maps memory types to their weight multipliers.
@@ -50,30 +44,19 @@ type DecayConfig struct {
 
 // KnowledgeConfig controls knowledge indexing.
 type KnowledgeConfig struct {
-	Enabled       bool     `toml:"enabled"`
-	ScanPaths     []string `toml:"scan_paths"`
-	ExtensionDirs bool     `toml:"extension_dirs"`
-	BudgetShare   float64  `toml:"budget_share"`
-}
-
-// HooksConfig controls git hooks.
-type HooksConfig struct {
-	PreCommit bool `toml:"pre_commit"`
+	Enabled     bool     `toml:"enabled"`
+	ScanPaths   []string `toml:"scan_paths"`
+	BudgetShare float64  `toml:"budget_share"`
 }
 
 // Default returns a Config with sane defaults matching the design doc.
 func Default() Config {
 	return Config{
 		Memory: MemoryConfig{
-			SchemaVersion:    "1.0",
-			TokenBudget:      constants.DefaultTokenBudget,
-			WALMaxEntries:    constants.DefaultWALMaxEntries,
-			ArchiveAfterDays: constants.DefaultArchiveAfterDays,
+			TokenBudget:   constants.DefaultTokenBudget,
+			WALMaxEntries: constants.DefaultWALMaxEntries,
 		},
 		Compaction: CompactionConfig{
-			Strategy:      "relevance_scored",
-			PreserveTypes: []string{"semantic", "procedural", "preference"},
-			DecayTypes:    []string{"episodic"},
 			TypeWeights: CompactionTypeWeights{
 				Preference: constants.WeightPreference,
 				Semantic:   constants.WeightSemantic,
@@ -98,11 +81,7 @@ func Default() Config {
 				"**/*.rules.md",
 				"CONTRIBUTING.md",
 			},
-			ExtensionDirs: true,
-			BudgetShare:   0.4,
-		},
-		Hooks: HooksConfig{
-			PreCommit: true,
+			BudgetShare: 0.4,
 		},
 	}
 }

@@ -70,6 +70,11 @@ func TestEntry_IsExpired(t *testing.T) {
 		t.Error("entry with Expires=0 should not be expired")
 	}
 
+	permanent := Entry{Expires: -1}
+	if permanent.IsExpired() {
+		t.Error("entry with Expires=-1 should be permanent")
+	}
+
 	futureExpiry := Entry{Expires: 9999999999}
 	if futureExpiry.IsExpired() {
 		t.Error("entry with future expiry should not be expired")
