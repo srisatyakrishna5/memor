@@ -1,6 +1,6 @@
 {
   "name": "@memor-dev/memor",
-  "version": "0.7",
+  "version": "0.7.",
   "description": "Local memory persistence for AI coding assistants. Zero cloud, zero git commits.",
   "publishConfig": {
     "access": "public"
@@ -19,7 +19,7 @@
   "bugs": "https://github.com/akashchekka/memor/issues",
   "repository": {
     "type": "git",
-    "url": "https://github.com/akashchekka/memor.git"
+    "url": "git+https://github.com/akashchekka/memor.git"
   },
   "license": "MIT",
   "bin": {
