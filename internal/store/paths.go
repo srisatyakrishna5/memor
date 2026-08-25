@@ -13,6 +13,7 @@ const (
 	ArchiveFile     = "memory.archive"
 	KnowledgeDBFile = "knowledge.db"
 	ConfigFile      = "config.toml"
+	LockFile        = "lock"
 )
 
 // Paths holds resolved paths to all memor files for a project.
@@ -24,6 +25,7 @@ type Paths struct {
 	Archive   string
 	Knowledge string
 	Config    string
+	Lock      string
 }
 
 // ResolvePaths computes all paths relative to a project root.
@@ -37,6 +39,7 @@ func ResolvePaths(projectRoot string) Paths {
 		Archive:   filepath.Join(root, ArchiveFile),
 		Knowledge: filepath.Join(root, KnowledgeDBFile),
 		Config:    filepath.Join(root, ConfigFile),
+		Lock:      filepath.Join(root, LockFile),
 	}
 }
 

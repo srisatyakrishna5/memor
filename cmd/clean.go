@@ -36,6 +36,14 @@ func runClean(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf(".memor/ not found — nothing to clean")
 	}
 
+	// clean rewrites the same files compaction owns, so take the state lock to
+	// keep a concurrent add or MCP session from half-surviving the reset.
+	lock, err := store.AcquireLock(paths.Lock, store.CompactLockTimeout)
+	if err != nil {
+		return fmt.Errorf("lock state: %w", err)
+	}
+	defer lock.Release()
+
 	// Reset memory.db to empty snapshot
 	if err := os.WriteFile(paths.MemoryDB, []byte(fmt.Sprintf("@mem v1 | 0 entries | budget:%d | compacted:none\n", constants.DefaultTokenBudget)), 0o644); err != nil {
 		return fmt.Errorf("reset memory.db: %w", err)
