@@ -28,6 +28,9 @@ jobs:
           - goos: windows
             goarch: amd64
             name: memor-win32-x64.exe
+          - goos: windows
+            goarch: arm64
+            name: memor-win32-arm64.exe
 
     steps:
       - uses: actions/checkout@v4
@@ -67,6 +70,8 @@ jobs:
 
   publish-npm:
     needs: release
+    # Forks build binaries but must not publish to the upstream package name.
+    if: ${{ !github.event.repository.fork }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
