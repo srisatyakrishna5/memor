@@ -52,6 +52,27 @@ func ResolveUserPaths() (Paths, error) {
 	return ResolvePaths(home), nil
 }
 
+// FindProjectRoot walks up from start looking for a directory that contains
+// .memor/. Long-running callers such as the MCP server are not guaranteed to be
+// launched from the project root. If no ancestor is initialized, start is
+// returned unchanged so callers report a consistent "run memor init" error.
+func FindProjectRoot(start string) string {
+	dir, err := filepath.Abs(start)
+	if err != nil {
+		return start
+	}
+	for {
+		if info, err := os.Stat(filepath.Join(dir, DirName)); err == nil && info.IsDir() {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return start
+		}
+		dir = parent
+	}
+}
+
 // EnsureDirs creates the .memor/ directory if it doesn't exist.
 func (p *Paths) EnsureDirs() error {
 	return os.MkdirAll(p.Root, 0o755)

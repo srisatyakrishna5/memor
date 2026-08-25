@@ -8,11 +8,13 @@
 // Flags:
 //
 //	--tools      Comma-separated tools to configure: copilot,claude,cursor,windsurf
+//	--no-mcp     Skip registering the memor MCP server in AI tool configs
 //
 // Examples:
 //
 //	memor init
 //	memor init --tools copilot,claude,cursor
+//	memor init --no-mcp
 package cmd
 
 import (
@@ -29,16 +31,18 @@ import (
 )
 
 var initTools string
+var initNoMCP bool
 
 var initCmd = &cobra.Command{
 	Use:   "init",
 	Short: "Initialize memory in the current project",
-	Long:  "Creates .memor/ directory, config.toml, empty WAL and snapshot, installs git hooks, and injects instructions into AI tool configs.",
+	Long:  "Creates .memor/ directory, config.toml, empty WAL and snapshot, installs git hooks, registers the memor MCP server, and injects instructions into AI tool configs.",
 	RunE:  runInit,
 }
 
 func init() {
 	initCmd.Flags().StringVar(&initTools, "tools", "", "Comma-separated tools to configure: copilot,claude,cursor,windsurf")
+	initCmd.Flags().BoolVar(&initNoMCP, "no-mcp", false, "Skip registering the memor MCP server in AI tool configs")
 }
 
 func runInit(cmd *cobra.Command, args []string) error {
@@ -97,6 +101,13 @@ func runInit(cmd *cobra.Command, args []string) error {
 	// Inject auto-approve settings for terminal commands
 	if err := injectAutoApproveSettings(cwd, initTools); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: could not inject auto-approve settings: %v\n", err)
+	}
+
+	// Register the MCP server so agents get memory as tools, not shell commands
+	if !initNoMCP {
+		if err := registerMCPServers(cwd, initTools); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: could not register MCP server: %v\n", err)
+		}
 	}
 
 	// Import bootstrap file if exists
@@ -323,6 +334,7 @@ func clearMemorInstructionsFile(path, instructions string) (bool, error) {
 // toolInstructionFile maps each tool to its auto-discovered instruction file.
 type toolInstructionFile struct {
 	toolName string
+	key      string // matches --tools values
 	path     string // relative to project root
 	content  string
 }
@@ -330,9 +342,9 @@ type toolInstructionFile struct {
 func getToolInstructionFiles() []toolInstructionFile {
 	instructions := makeInstructions()
 	return []toolInstructionFile{
-		{"GitHub Copilot", "AGENTS.md", instructions},
-		{"Cursor", ".cursorrules", instructions},
-		{"Windsurf", ".windsurfrules", instructions},
+		{"GitHub Copilot", "copilot", "AGENTS.md", instructions},
+		{"Cursor", "cursor", ".cursorrules", instructions},
+		{"Windsurf", "windsurf", ".windsurfrules", instructions},
 	}
 }
 
@@ -341,15 +353,11 @@ func injectToolConfigs(projectRoot string, toolsFlag string) error {
 
 	// If specific tools requested, filter
 	if toolsFlag != "" {
-		requested := make(map[string]struct{})
-		for _, t := range strings.Split(toolsFlag, ",") {
-			requested[strings.TrimSpace(strings.ToLower(t))] = struct{}{}
-		}
+		requested := parseToolsFlag(toolsFlag)
 
 		var filtered []toolInstructionFile
 		for _, inf := range files {
-			key := strings.ToLower(strings.SplitN(inf.toolName, " ", 2)[0])
-			if _, ok := requested[key]; ok {
+			if _, ok := requested[inf.key]; ok {
 				filtered = append(filtered, inf)
 			}
 		}

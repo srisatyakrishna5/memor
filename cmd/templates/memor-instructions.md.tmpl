@@ -3,6 +3,8 @@
 This project uses [memor](https://github.com/akashchekka/memor) for persistent AI memory.
 You MUST follow these rules. Skipping any step is a violation.
 
+**If the memor MCP tools are available** (`memory_context`, `memory_add`, `memory_search`, `code_get`, `code_save`), call those instead of the terminal commands below. The rules and timing are identical — only the mechanism differs.
+
 **Command timing (read this first):**
 - **Before the conversation starts:** only `memor context` runs.
 - **Before reading a source file (mid-turn):** `memor code load <file>` is the sole exception — it's a read-only cache check that prevents redundant file reads.

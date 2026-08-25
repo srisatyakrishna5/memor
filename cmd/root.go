@@ -44,5 +44,6 @@ func init() {
 	rootCmd.AddCommand(codeCmd)
 	rootCmd.AddCommand(exportCmd)
 	rootCmd.AddCommand(importCmd)
+	rootCmd.AddCommand(mcpCmd)
 	rootCmd.AddCommand(versionCmd)
 }
