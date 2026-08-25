@@ -26,3 +26,12 @@ npm/bin/memor-*
 Thumbs.db
 
 ppt
+
+# .github
+.github/agents
+.github/workflows
+.github/instructions
+.github/skills
+.github/hooks
+.github/plugins
+.github/workflows/*.md
