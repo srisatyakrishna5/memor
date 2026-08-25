@@ -3,27 +3,40 @@
 This project uses [memor](https://github.com/akashchekka/memor) for persistent AI memory.
 You MUST follow these rules. Skipping any step is a violation.
 
-**If the memor MCP tools are available** (`memory_context`, `memory_add`, `memory_search`, `code_get`, `code_save`), call those instead of the terminal commands below. The rules and timing are identical — only the mechanism differs.
+## Prefer the MCP tools
+When tools named `memory_context`, `memory_add`, `memory_search`, `code_get` and `code_save` are available, use them. Fall back to the `memor` CLI only when they are not. Never mix both in one turn.
 
-**Command timing (read this first):**
-- **Before the conversation starts:** only `memor context` runs.
-- **Before reading a source file (mid-turn):** `memor code load <file>` is the sole exception — it's a read-only cache check that prevents redundant file reads.
-- **After your response (end of turn):** all writes — `memor add`, `memor code save` — run as the final tool calls of the turn.
+| Purpose | Tool | CLI fallback |
+| --- | --- | --- |
+| Load prior context | `memory_context` | `memor context` |
+| Record a memory | `memory_add` | `memor add` |
+| Search memories | `memory_search` | `memor search` |
+| Check a stored file summary | `code_get` | `memor code load <file>` |
+| Store a file summary | `code_save` | `memor code save <file>` |
 
-## RULE 1: At the start of a new conversation
-You MUST run `memor context` in the terminal before any other tool call. This applies only to the first user message of a conversation, not every turn.
+## RULE 1: Load context once per conversation
+Call `memory_context` on the first user message, before any other tool. Do not call it again on later turns.
 
-## RULE 2: At the end of every turn
-After producing your response, and as the final tool calls of the turn, write 2-3 sentences capturing the decision, reasoning, and rejected alternatives. You MUST run one of:
-- `memor add -s "#tag: summary"` — decisions, facts, architecture
-- `memor add --type episodic -s "#tag: summary"` — bugs fixed, events
-- `memor add --type procedural -s "#tag: summary"` — commands, workflows
-- `memor add --type preference -s "#tag: summary"` — style conventions
+## RULE 2: Check before reading a source file
+Call `code_get` before opening any source file. This is the only mid-turn call.
+- `status: fresh` — trust the stored summary and do NOT read the file.
+- `status: stale`, `missing` or `unrecorded` — read the file, then `code_save` at end of turn.
 
-## RULE 3: Around any source file read or write
-- **Before reading a file**, ALWAYS check first: `memor code load <file>` — skip the read if the cached summary is fresh.
-- **After reading or writing a file** (as part of the end-of-turn writes in Rule 2), run: `memor code save <file> --exports "..." --summary "..."`
-- For complex files, optionally add logic: `memor code save <file> --logic "step → step"`
+Follow the `recommendation` field it returns.
 
-## RULE 4: NEVER edit .memor/ files
-ALWAYS use the `memor` CLI. NEVER use file-editing tools on `.memor/` files.
+## RULE 3: Write at the end of the turn
+After producing your response, as the final tool calls of the turn:
+- `memory_add` — 2-3 self-contained sentences capturing the decision, the reasoning, and what was rejected. Set `type` to `semantic` (decisions, architecture), `episodic` (bugs fixed, events), `procedural` (commands, workflows), or `preference` (style conventions). Defaults to `semantic`.
+- `code_save` — for each source file you read or changed this turn.
+
+Tag every entry, reusing existing tags. Consistent tags are what make retrieval work.
+
+## RULE 4: Record only what is worth remembering
+Memory is token-budgeted, so every low-value entry crowds out a useful one.
+
+Record: decisions and why, rejected alternatives, non-obvious constraints, conventions, reproducible workflows, root causes.
+
+Skip: restatements of the code, anything already stored, routine edits, and facts recoverable by reading the file.
+
+## RULE 5: NEVER edit .memor/ files
+Use the tools, or the CLI when tools are unavailable. NEVER use file-editing tools on anything under `.memor/`.
