@@ -78,17 +78,12 @@ func maybeAutoCompact(paths store.Paths) {
 		fmt.Fprintf(os.Stderr, "memor: auto-compact skipped: load config: %v\n", err)
 		return
 	}
-	count, err := store.WALEntryCount(paths.MemoryWAL)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "memor: auto-compact skipped: count WAL entries: %v\n", err)
-		return
-	}
-	if count < cfg.Memory.WALMaxEntries {
-		return
-	}
-	written, archived, err := engine.Compact(paths, cfg)
+	written, archived, ran, err := engine.AutoCompact(paths, cfg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "memor: auto-compact failed: %v\n", err)
+		return
+	}
+	if !ran {
 		return
 	}
 	fmt.Printf("Auto-compacted: %d entries in snapshot, %d archived\n", written, archived)

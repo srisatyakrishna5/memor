@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 
@@ -12,8 +13,20 @@ import (
 // Compact merges the WAL + existing snapshot into a fresh memory.db.
 // Returns the number of entries written and the number archived.
 func Compact(paths store.Paths, cfg config.Config) (written int, archived int, err error) {
+	lock, err := store.AcquireLock(paths.Lock, store.CompactLockTimeout)
+	if err != nil {
+		return 0, 0, fmt.Errorf("lock state: %w", err)
+	}
+	defer lock.Release()
+
+	return compactLocked(paths, cfg)
+}
+
+// compactLocked performs the compaction. Callers must already hold the state
+// lock; nothing it calls acquires the lock itself, so it cannot self-deadlock.
+func compactLocked(paths store.Paths, cfg config.Config) (written int, archived int, err error) {
 	// 1. PARSE — read WAL and existing snapshot
-	walEntries, err := store.ReadWAL(paths.MemoryWAL)
+	walEntries, walConsumed, err := store.ReadWALConsumed(paths.MemoryWAL)
 	if err != nil {
 		return 0, 0, fmt.Errorf("read WAL: %w", err)
 	}
@@ -57,11 +70,40 @@ func Compact(paths store.Paths, cfg config.Config) (written int, archived int, e
 		return 0, 0, fmt.Errorf("write snapshot: %w", err)
 	}
 
-	if err := store.TruncateWAL(paths.MemoryWAL); err != nil {
+	if err := store.TruncateWALPrefix(paths.MemoryWAL, walConsumed); err != nil {
 		return 0, 0, fmt.Errorf("truncate WAL: %w", err)
 	}
 
 	return len(result.Written), len(evicted), nil
+}
+
+// AutoCompact compacts only once the WAL reaches the configured threshold.
+// It writes nothing to stdout so callers on a stdio transport stay protocol-safe.
+func AutoCompact(paths store.Paths, cfg config.Config) (written, archived int, ran bool, err error) {
+	count, err := store.WALEntryCount(paths.MemoryWAL)
+	if err != nil {
+		return 0, 0, false, fmt.Errorf("count WAL entries: %w", err)
+	}
+	if count < cfg.Memory.WALMaxEntries {
+		return 0, 0, false, nil
+	}
+
+	// Opportunistic: if someone else is compacting or writing, skip this round
+	// rather than stalling the caller. The threshold will still be met next time.
+	lock, err := store.AcquireLock(paths.Lock, 0)
+	if errors.Is(err, store.ErrLockBusy) {
+		return 0, 0, false, nil
+	}
+	if err != nil {
+		return 0, 0, false, fmt.Errorf("lock state: %w", err)
+	}
+	defer lock.Release()
+
+	written, archived, err = compactLocked(paths, cfg)
+	if err != nil {
+		return 0, 0, false, err
+	}
+	return written, archived, true, nil
 }
 
 // mergeEntries combines snapshot + WAL entries. WAL entries (newer) come last.

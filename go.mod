@@ -1,10 +1,11 @@
 module github.com/memor-dev/memor
 
-go 1.23
+go 1.25.0
 
 require (
 	github.com/pelletier/go-toml/v2 v2.2.4
 	github.com/spf13/cobra v1.9.1
+	golang.org/x/sys v0.47.0
 )
 
 require (
