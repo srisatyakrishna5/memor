@@ -3,6 +3,7 @@ package memory
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"strconv"
 	"strings"
 	"time"
 
@@ -137,6 +138,22 @@ func ContentID(content string) string {
 	normalized := strings.ToLower(strings.TrimSpace(content))
 	hash := sha256.Sum256([]byte(normalized))
 	return hex.EncodeToString(hash[:])[:constants.ContentIDLength]
+}
+
+// ParseExpiry converts "YYYY-MM-DD" or a day duration like "30d" into a Unix timestamp.
+func ParseExpiry(s string) (int64, error) {
+	s = strings.TrimSpace(s)
+	if digits, ok := strings.CutSuffix(s, "d"); ok {
+		if days, err := strconv.Atoi(digits); err == nil {
+			return time.Now().AddDate(0, 0, days).Unix(), nil
+		}
+	}
+
+	t, err := time.Parse("2006-01-02", s)
+	if err != nil {
+		return 0, err
+	}
+	return t.Unix(), nil
 }
 
 // ScoredEntry wraps an Entry with a computed relevance score.

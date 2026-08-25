@@ -19,16 +19,13 @@
 package cmd
 
 import (
-	"bufio"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
-	"github.com/memor-dev/memor/internal/constants"
+	"github.com/memor-dev/memor/internal/engine"
 	"github.com/memor-dev/memor/internal/memory"
 	"github.com/memor-dev/memor/internal/store"
 	"github.com/spf13/cobra"
@@ -99,7 +96,7 @@ func runCodeSave(cmd *cobra.Command, args []string) error {
 	filePath := args[0]
 
 	// Compute file hash and LOC
-	hash, loc, err := fileHashAndLOC(filepath.Join(cwd, filePath))
+	hash, loc, err := engine.FileHashAndLOC(filepath.Join(cwd, filePath))
 	if err != nil {
 		// File might not exist locally (agent describing a remote or planned file)
 		hash = "000000"
@@ -181,7 +178,7 @@ func runCodeLoad(cmd *cobra.Command, args []string) error {
 	}
 
 	// Collect all code entries from snapshot + WAL
-	entries, err := allCodeEntries(paths)
+	entries, err := engine.CodeEntries(paths)
 	if err != nil {
 		return err
 	}
@@ -229,13 +226,7 @@ func runCodeLoad(cmd *cobra.Command, args []string) error {
 		}
 
 		// Check if file has changed
-		status := "fresh"
-		currentHash, _, err := fileHashAndLOC(filepath.Join(cwd, e.Meta.FilePath))
-		if err != nil {
-			status = "missing"
-		} else if currentHash != e.Meta.Hash {
-			status = "stale"
-		}
+		status := engine.CodeStatus(cwd, e.Meta)
 
 		fmt.Printf("@c %s [%d LOC | %s] (%s)\n", e.Meta.FilePath, e.Meta.LOC, e.Meta.Hash, status)
 		if len(e.Meta.Exports) > 0 {
@@ -270,7 +261,7 @@ func runCodeList(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf(".memor/ not found — run 'memor init' first")
 	}
 
-	entries, err := allCodeEntries(paths)
+	entries, err := engine.CodeEntries(paths)
 	if err != nil {
 		return err
 	}
@@ -289,55 +280,4 @@ func runCodeList(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
-}
-
-// allCodeEntries returns all @c entries from snapshot + WAL, deduped by file path.
-func allCodeEntries(paths store.Paths) ([]memory.Entry, error) {
-	snap, err := store.ReadSnapshot(paths.MemoryDB)
-	if err != nil {
-		return nil, err
-	}
-
-	walEntries, err := store.ReadWAL(paths.MemoryWAL)
-	if err != nil {
-		return nil, err
-	}
-
-	// Dedup by file path — WAL entries (newer) win
-	byPath := make(map[string]memory.Entry)
-	for _, e := range snap.Entries {
-		if e.Type == memory.TypeCode && e.Meta != nil {
-			byPath[e.Meta.FilePath] = e
-		}
-	}
-	for _, e := range walEntries {
-		if e.Type == memory.TypeCode && e.Meta != nil {
-			byPath[e.Meta.FilePath] = e
-		}
-	}
-
-	var result []memory.Entry
-	for _, e := range byPath {
-		result = append(result, e)
-	}
-	return result, nil
-}
-
-// fileHashAndLOC computes SHA-256[:6] and line count for a file.
-func fileHashAndLOC(path string) (string, int, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return "", 0, err
-	}
-
-	hash := sha256.Sum256(data)
-	hashStr := hex.EncodeToString(hash[:])[:constants.FileHashLength]
-
-	loc := 0
-	scanner := bufio.NewScanner(strings.NewReader(string(data)))
-	for scanner.Scan() {
-		loc++
-	}
-
-	return hashStr, loc, nil
 }

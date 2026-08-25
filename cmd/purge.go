@@ -32,7 +32,7 @@ var purgeCmd = &cobra.Command{
 }
 
 func init() {
-	purgeCmd.Flags().BoolVar(&purgeAll, "all", false, "Also remove injected instructions from AI tool config files (AGENTS.md, .cursorrules, .windsurfrules)")
+	purgeCmd.Flags().BoolVar(&purgeAll, "all", false, "Also remove injected instructions, auto-approve settings, and MCP registration from AI tool config files")
 }
 
 func runPurge(cmd *cobra.Command, args []string) error {
@@ -69,6 +69,9 @@ func runPurge(cmd *cobra.Command, args []string) error {
 
 		// Remove memor auto-approve entries from tool settings files.
 		removeAutoApproveSettings(cwd)
+
+		// Remove the memor MCP server registration from tool configs.
+		deregisterMCPServers(cwd)
 	}
 
 	fmt.Println("Purge complete.")

@@ -114,7 +114,7 @@ func runAdd(cmd *cobra.Command, args []string) error {
 	}
 
 	if addExpires != "" {
-		expiry, err := parseExpiry(addExpires)
+		expiry, err := memory.ParseExpiry(addExpires)
 		if err != nil {
 			return fmt.Errorf("invalid expiry %q: %w", addExpires, err)
 		}
@@ -160,21 +160,4 @@ func parseShorthand(s string) (memory.Entry, error) {
 		Content:   content,
 		Tags:      tags,
 	}, nil
-}
-
-func parseExpiry(s string) (int64, error) {
-	// Try duration format like "30d"
-	if strings.HasSuffix(s, "d") {
-		var days int
-		if _, err := fmt.Sscanf(s, "%dd", &days); err == nil {
-			return time.Now().AddDate(0, 0, days).Unix(), nil
-		}
-	}
-
-	// Try date format
-	t, err := time.Parse("2006-01-02", s)
-	if err != nil {
-		return 0, err
-	}
-	return t.Unix(), nil
 }
