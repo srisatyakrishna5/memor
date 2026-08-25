@@ -29,7 +29,6 @@ ppt
 
 # .github
 .github/agents
-.github/workflows
 .github/instructions
 .github/skills
 .github/hooks
