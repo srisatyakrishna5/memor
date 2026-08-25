@@ -17,30 +17,45 @@ func DefaultBM25Params() BM25Params {
 }
 
 // BM25Scorer scores documents against a query using BM25.
+//
+// Term statistics are computed once at construction, so scoring costs one map
+// lookup per query term rather than a scan over the whole corpus.
 type BM25Scorer struct {
 	Params BM25Params
-	Docs   []string  // document texts (lowercased)
 	AvgDL  float64   // average document length in terms
 	DocLen []float64 // per-document term count
 	N      int       // total document count
+
+	termFreqs []map[string]int // per-document term -> occurrences
+	docFreqs  map[string]int   // term -> number of documents containing it
 }
 
 // NewBM25Scorer builds a scorer from a set of document texts.
 func NewBM25Scorer(docs []string, params BM25Params) *BM25Scorer {
 	s := &BM25Scorer{
-		Params: params,
-		Docs:   make([]string, len(docs)),
-		DocLen: make([]float64, len(docs)),
-		N:      len(docs),
+		Params:    params,
+		DocLen:    make([]float64, len(docs)),
+		N:         len(docs),
+		termFreqs: make([]map[string]int, len(docs)),
+		docFreqs:  make(map[string]int),
 	}
 
 	totalLen := 0.0
 	for i, doc := range docs {
-		lower := strings.ToLower(doc)
-		s.Docs[i] = lower
-		terms := strings.Fields(lower)
+		terms := tokenize(doc)
 		s.DocLen[i] = float64(len(terms))
 		totalLen += s.DocLen[i]
+
+		tf := make(map[string]int, len(terms))
+		for _, t := range terms {
+			tf[t]++
+		}
+		s.termFreqs[i] = tf
+
+		// Document frequency counts documents, so each distinct term counts once.
+		for t := range tf {
+			s.docFreqs[t]++
+		}
 	}
 
 	if s.N > 0 {
@@ -50,37 +65,27 @@ func NewBM25Scorer(docs []string, params BM25Params) *BM25Scorer {
 	return s
 }
 
-// Score computes BM25 score for a single document against the query.
+// Score computes the BM25 score for a single document against the query.
 func (s *BM25Scorer) Score(docIdx int, query string) float64 {
-	queryTerms := strings.Fields(strings.ToLower(query))
-	if len(queryTerms) == 0 {
+	// A corpus of only empty documents would otherwise divide by zero.
+	if s.AvgDL == 0 {
 		return 0
 	}
 
-	docTerms := strings.Fields(s.Docs[docIdx])
+	tf := s.termFreqs[docIdx]
 	dl := s.DocLen[docIdx]
 
-	// Count term frequencies in this document
-	tf := make(map[string]int, len(docTerms))
-	for _, t := range docTerms {
-		tf[t]++
-	}
-
 	score := 0.0
-	for _, qt := range queryTerms {
-		// Count how many docs contain this query term (for IDF)
-		df := s.docFreq(qt)
-		if df == 0 {
+	for _, qt := range tokenize(query) {
+		f := float64(tf[qt])
+		if f == 0 {
 			continue
 		}
 
-		// IDF: log((N - df + 0.5) / (df + 0.5) + 1)
-		idf := math.Log((float64(s.N)-float64(df)+0.5)/(float64(df)+0.5) + 1.0)
+		// f > 0 guarantees df >= 1, so the IDF denominator is never zero.
+		df := float64(s.docFreqs[qt])
+		idf := math.Log((float64(s.N)-df+0.5)/(df+0.5) + 1.0)
 
-		// Term frequency in current document
-		f := float64(tf[qt])
-
-		// BM25 numerator and denominator
 		num := f * (s.Params.K1 + 1)
 		denom := f + s.Params.K1*(1-s.Params.B+s.Params.B*(dl/s.AvgDL))
 
@@ -90,13 +95,8 @@ func (s *BM25Scorer) Score(docIdx int, query string) float64 {
 	return score
 }
 
-// docFreq counts how many documents contain the given term.
-func (s *BM25Scorer) docFreq(term string) int {
-	count := 0
-	for _, doc := range s.Docs {
-		if strings.Contains(doc, term) {
-			count++
-		}
-	}
-	return count
+// tokenize splits text into lowercased terms. Indexing and querying must share
+// this function or a query term will never line up with an indexed one.
+func tokenize(text string) []string {
+	return strings.Fields(strings.ToLower(text))
 }
