@@ -16,6 +16,7 @@ import (
 	"github.com/memor-dev/memor/internal/graph"
 	"github.com/memor-dev/memor/internal/graph/extract"
 	"github.com/memor-dev/memor/internal/store"
+	"github.com/memor-dev/memor/internal/vcs"
 )
 
 // Session is one project's resolved state.
@@ -23,15 +24,9 @@ type Session struct {
 	Root  string
 	Paths store.Paths
 	Cfg   config.Config
-
-	// Migrated is set when opening the session converted a v1 store, so a
-	// caller can report what happened instead of finding nothing left to do.
-	Migrated *graph.MigrationReport
 }
 
 // Open resolves the project root by walking up from start and loads its config.
-// A v1 store found without a v2 one is migrated in place, so a user upgrading
-// the binary never has to run a command to keep working.
 func Open(start string) (*Session, error) {
 	root := store.FindProjectRoot(start)
 	paths := store.ResolvePaths(root)
@@ -44,16 +39,7 @@ func Open(start string) (*Session, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load config: %w", err)
 	}
-
-	s := &Session{Root: root, Paths: paths, Cfg: cfg}
-	if graph.NeedsMigration(paths) {
-		report, err := graph.Migrate(paths, cfg)
-		if err != nil {
-			return nil, fmt.Errorf("migrate v1 store: %w", err)
-		}
-		s.Migrated = &report
-	}
-	return s, nil
+	return &Session{Root: root, Paths: paths, Cfg: cfg}, nil
 }
 
 // Create initializes a project at dir without requiring it to exist already.
@@ -75,13 +61,13 @@ func Create(dir string) (*Session, error) {
 	return &Session{Root: dir, Paths: paths, Cfg: cfg}, nil
 }
 
-// Graph loads the graph and its derived index.
+// Graph loads the store and builds its term index.
 func (s *Session) Graph() (*graph.Graph, *graph.Index, error) {
 	g, err := graph.Load(s.Paths)
 	if err != nil {
 		return nil, nil, err
 	}
-	return g, graph.LoadIndex(s.Paths, g), nil
+	return g, graph.BuildIndex(g), nil
 }
 
 // RememberInput describes a fact to record.
@@ -89,16 +75,18 @@ type RememberInput struct {
 	Content    string
 	Type       string
 	Tags       []string
-	Files      []string // targets of explains edges
+	Files      []string // nodes this memory explains
 	Symbols    []string
 	Expires    string
 	Supersedes string
+	Task       string
+	Status     string
 }
 
-// Remember records a memory node plus its topic and explains edges.
+// Remember records a memory node with its tags and attachments.
 //
-// An explains edge is what no comparable tool has: it binds a decision to the
-// exact file or symbol where a future agent would otherwise repeat the mistake.
+// Binding a memory to the exact file or symbol it concerns is what makes it
+// surface at the moment a future agent would otherwise repeat the mistake.
 func (s *Session) Remember(in RememberInput) (*graph.Node, error) {
 	content := strings.TrimSpace(in.Content)
 	if content == "" {
@@ -123,20 +111,24 @@ func (s *Session) Remember(in RememberInput) (*graph.Node, error) {
 		}
 		node.Exp = exp
 	}
-
-	records := []graph.Record{graph.NodeRecord(node)}
-
-	for _, tag := range normalizeTags(in.Tags) {
-		topic := graph.TopicNode(tag)
-		records = append(records,
-			graph.NodeRecord(topic),
-			graph.EdgeRecord(graph.Edge{From: node.ID, To: topic.ID, Kind: graph.EdgeTagged, W: 1}))
+	node.SetMetaList(graph.MetaTags, normalizeTags(in.Tags))
+	node.SetMeta(graph.MetaTask, strings.TrimSpace(in.Task))
+	if status, err := normalizeStatus(in.Status); err != nil {
+		return nil, err
+	} else {
+		node.SetMeta(graph.MetaStatus, status)
+	}
+	if head, err := vcs.ReadHead(s.Root); err == nil {
+		node.SetMeta(graph.MetaCommit, head.SHA)
 	}
 
 	g, _, err := s.Graph()
 	if err != nil {
 		return nil, err
 	}
+
+	records := []graph.Record{}
+	var attached []string
 
 	for _, path := range in.Files {
 		rel := s.RelPath(path)
@@ -145,8 +137,9 @@ func (s *Session) Remember(in RememberInput) (*graph.Node, error) {
 		}
 		target, ok := g.FindFile(rel)
 		if !ok {
-			// A file outside the graph is still worth binding to: extraction
-			// will create the node later and the edge resolves then.
+			// A file outside the store is still worth binding to: extraction
+			// creates the node later and the attachment resolves then, because
+			// the ID is derived from the path rather than assigned.
 			hash, loc, err := graph.FileHashAndLOC(filepath.Join(s.Root, rel))
 			if err != nil {
 				continue
@@ -154,30 +147,39 @@ func (s *Session) Remember(in RememberInput) (*graph.Node, error) {
 			target = graph.FileNode(rel, "", loc, hash, "")
 			records = append(records, graph.NodeRecord(target))
 		}
-		records = append(records, graph.EdgeRecord(
-			graph.Edge{From: node.ID, To: target.ID, Kind: graph.EdgeExplains, W: 1}))
+		attached = append(attached, target.ID)
 	}
 
 	for _, name := range in.Symbols {
 		for _, sym := range g.FindSymbols(name) {
-			if !strings.EqualFold(sym.Name, strings.TrimSpace(name)) {
-				continue
+			if strings.EqualFold(sym.Name, strings.TrimSpace(name)) {
+				attached = append(attached, sym.ID)
 			}
-			records = append(records, graph.EdgeRecord(
-				graph.Edge{From: node.ID, To: sym.ID, Kind: graph.EdgeExplains, W: 1}))
 		}
 	}
 
+	node.SetMetaList(graph.MetaExplains, attached)
 	if sup := strings.TrimSpace(in.Supersedes); sup != "" {
-		records = append(records, graph.EdgeRecord(
-			graph.Edge{From: node.ID, To: sup, Kind: graph.EdgeSupersedes, W: 1}))
+		node.SetMetaList(graph.MetaSupersedes, []string{sup})
 	}
 
+	records = append(records, graph.NodeRecord(node))
 	if err := graph.Append(s.Paths.Log, records); err != nil {
 		return nil, fmt.Errorf("write memory: %w", err)
 	}
 	s.AutoCompact()
 	return node, nil
+}
+
+func normalizeStatus(status string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "":
+		return "", nil
+	case graph.StatusOpen, graph.StatusDone, graph.StatusBlocked:
+		return strings.ToLower(strings.TrimSpace(status)), nil
+	default:
+		return "", fmt.Errorf("invalid status %q — use open, done, or blocked", status)
+	}
 }
 
 // Describe attaches or updates an agent-authored summary on a file node.
@@ -202,16 +204,9 @@ func (s *Session) Describe(path, summary, patterns, logic string, tags []string)
 	node.SetMeta(graph.MetaOrigin, graph.OriginAgent)
 	node.SetMeta(graph.MetaPatterns, strings.TrimSpace(patterns))
 	node.SetMeta(graph.MetaLogic, strings.TrimSpace(logic))
+	node.SetMetaList(graph.MetaTags, normalizeTags(tags))
 
-	records := []graph.Record{graph.NodeRecord(node)}
-	for _, tag := range normalizeTags(tags) {
-		topic := graph.TopicNode(tag)
-		records = append(records,
-			graph.NodeRecord(topic),
-			graph.EdgeRecord(graph.Edge{From: node.ID, To: topic.ID, Kind: graph.EdgeTagged, W: 1}))
-	}
-
-	if err := graph.Append(s.Paths.Log, records); err != nil {
+	if err := graph.Append(s.Paths.Log, []graph.Record{graph.NodeRecord(node)}); err != nil {
 		return nil, fmt.Errorf("write summary: %w", err)
 	}
 	s.AutoCompact()
@@ -223,9 +218,9 @@ type BuildReport struct {
 	Files    int
 	Symbols  int
 	Docs     int
-	Edges    int
 	Nodes    int
 	Skipped  int
+	Commit   string
 	Duration time.Duration
 }
 
@@ -241,21 +236,36 @@ func (s *Session) Build() (BuildReport, error) {
 		return BuildReport{}, err
 	}
 
-	g, err := graph.Rebuild(s.Paths, s.Cfg, result.Nodes, result.Edges)
+	g, err := graph.Rebuild(s.Paths, s.Cfg, result.Nodes)
 	if err != nil {
 		return BuildReport{}, err
 	}
 
 	counts := g.CountByKind()
-	return BuildReport{
+	report := BuildReport{
 		Files:    counts[graph.KindFile.String()],
 		Symbols:  counts[graph.KindSym.String()],
 		Docs:     counts[graph.KindDoc.String()],
-		Edges:    g.EdgeCount(),
 		Nodes:    g.NodeCount(),
 		Skipped:  result.FilesSkipped,
 		Duration: time.Since(start),
-	}, nil
+	}
+
+	// The commit is written last and only on success, so a failed build can
+	// never leave a watermark claiming the repository was indexed at it.
+	state := store.State{
+		IndexedAt:   time.Now().Unix(),
+		FileCount:   report.Files,
+		SymbolCount: report.Symbols,
+	}
+	if head, err := vcs.ReadHead(s.Root); err == nil {
+		state.IndexedCommit = head.SHA
+		report.Commit = head.SHA
+	}
+	if err := store.WriteState(s.Paths.State, state); err != nil {
+		return report, fmt.Errorf("write state: %w", err)
+	}
+	return report, nil
 }
 
 // Status reports node counts, staleness, and footprint.

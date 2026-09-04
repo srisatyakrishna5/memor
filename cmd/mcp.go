@@ -1,8 +1,8 @@
 // mcp.go — memor mcp
 //
-// Serves the repository graph over the Model Context Protocol on stdio, so MCP
-// hosts such as GitHub Copilot in VS Code can call it as native tools instead
-// of shelling out to the CLI.
+// Serves this repository's state over the Model Context Protocol on stdio, so
+// MCP hosts such as GitHub Copilot in VS Code can call it as native tools
+// instead of shelling out to the CLI.
 //
 // Nothing may be written to stdout while this runs: stdout carries JSON-RPC.
 //
@@ -30,12 +30,13 @@ var mcpProject string
 
 var mcpCmd = &cobra.Command{
 	Use:   "mcp",
-	Short: "Serve the repository graph over the Model Context Protocol",
-	Long: `Serve the repository graph to MCP hosts over stdio.
+	Short: "Serve this repository's state over the Model Context Protocol",
+	Long: `Serve this repository's state to MCP hosts over stdio.
 
-Exposes repo_map, symbol_find, symbol_read, remember, and graph_status as
-tools. The project root is discovered by walking up from the working directory,
-so the server can be launched from a subdirectory.
+Exposes repo_brief, repo_changes, repo_map, symbol_find, symbol_read, remember,
+and memor_status as tools, arranged so an agent starts with the cheapest call
+and escalates only when it has to. The project root is discovered by walking up
+from the working directory, so the server can be launched from a subdirectory.
 
 Register with VS Code by adding to .vscode/mcp.json:
 

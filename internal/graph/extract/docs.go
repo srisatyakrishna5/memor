@@ -73,17 +73,8 @@ func (b *builder) indexDoc(rel, abs string) {
 	for _, sec := range chunkByHeading(content) {
 		node := graph.DocNode(rel, sec.name, sec.summary)
 		node.Span = &graph.Span{Path: rel, L0: sec.line, L1: sec.endLine, Hash: hash}
+		node.SetMetaList(graph.MetaTags, topicsIn(sec.name+" "+sec.summary))
 		b.addNode(node)
-		b.attachTopics(node.ID, topicsIn(sec.name+" "+sec.summary))
-	}
-}
-
-// attachTopics promotes tags to nodes and links them. Topics being first-class
-// nodes is what lets a tag participate in the same graph walk as a file.
-func (b *builder) attachTopics(nodeID string, tags []string) {
-	for _, tag := range tags {
-		topic := b.addNode(graph.TopicNode(tag))
-		b.addEdge(nodeID, topic.ID, graph.EdgeTagged, 1)
 	}
 }
 

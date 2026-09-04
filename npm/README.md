@@ -3,12 +3,12 @@ title: npm package for Memor
 description: Install and use Memor through npm
 ---
 
-**Repository knowledge graph and persistent memory for AI coding assistants.**
+**Persistent repository state and memory for AI coding assistants.**
 
-Every AI coding tool starts each conversation with no structural model of your
-repository, so it reads whole files to find out where anything is. Memor indexes
-the repository into one graph and hands the assistant a task-ranked map within a
-token budget.
+Every AI coding tool starts each conversation knowing nothing about your
+repository — above all, not what changed since it last worked here. So it reads
+whole files to rebuild that picture every session. Memor remembers it between
+sessions and hands the assistant a few hundred tokens instead.
 
 Local files. Ranked context. Zero cloud, zero daemon, zero git commits.
 
@@ -40,6 +40,12 @@ Use `memor init --tools claude,cursor` to register additional MCP hosts.
 ## Additional Commands
 
 ```bash
+# Start here: where you are, what changed, what is unfinished
+memor brief
+
+# What moved since the last build, or since a given commit
+memor changes
+
 # Print the task-ranked map
 memor context --query "where is auth handled"
 
@@ -59,8 +65,8 @@ memor status
 ## How It Works
 
 ```
-Repository ──► EXTRACT (files, symbols, imports, spans)
-                    │
+Repository ──► INDEX (files, purposes, symbols, imports, spans)
+                    │  records the commit it indexed
 Conversations ──► APPEND to graph.log (JSONL)
                     │
                     ▼
@@ -70,26 +76,32 @@ Conversations ──► APPEND to graph.log (JSONL)
                graph.snap  ──►  graph.db (rendered projection)
                     │
                     ▼
-         RETRIEVE (BM25 + proximity + PageRank + tags + recency)
+         RETRIEVE (BM25 + recent-change + tags + recency)
                     │
                     ▼
-         AI tools call repo_map at conversation start
+         AI tools call repo_brief at conversation start
 ```
 
 - **Extraction**: deterministic, local, no model call and no CGO
-- **Spans, not copies**: the graph stores coordinates into files git already tracks
+- **Spans, not copies**: coordinates into files git already tracks
+- **Change tracking**: git tells memor what moved; each agent gets a watermark
 - **Retrieval**: one pipeline, with a precision floor that drops rather than pads
 - **Compaction**: deduplicates, decays, archives, enforces the budget
 
 ## MCP Tools
 
-| Tool | Replaces |
+A ladder, cheapest first — an agent starts at the top and escalates only when it
+has to. Reading whole files is the fallback, not the default.
+
+| Tool | Answers |
 |---|---|
-| `repo_map` | Reading files to find out where anything is |
-| `symbol_find` | grep and workspace search |
-| `symbol_read` | Whole-file reads |
-| `remember` | Losing the decision when the conversation ends |
-| `graph_status` | Guessing whether the map is trustworthy |
+| `repo_brief` | Where am I, what moved, what was I doing? |
+| `repo_changes` | Which files exactly, and do they matter? |
+| `repo_map` | Show me code I have not seen |
+| `symbol_find` | Where is this one thing? |
+| `symbol_read` | Show me its body |
+| `remember` | Record this for next time |
+| `memor_status` | Can I trust the index? |
 
 ## Supported Platforms
 

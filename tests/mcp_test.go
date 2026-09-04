@@ -7,10 +7,13 @@ import (
 	"testing"
 
 	"github.com/memor-dev/memor/internal/config"
+	"github.com/memor-dev/memor/internal/constants"
 	"github.com/memor-dev/memor/internal/graph"
 	"github.com/memor-dev/memor/internal/graph/extract"
 	"github.com/memor-dev/memor/internal/mcp"
+	sessionpkg "github.com/memor-dev/memor/internal/session"
 	"github.com/memor-dev/memor/internal/store"
+	"github.com/memor-dev/memor/internal/token"
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -64,7 +67,7 @@ func verify(token string) error {
 	if err != nil {
 		t.Fatalf("extract: %v", err)
 	}
-	if _, err := graph.Rebuild(paths, cfg, result.Nodes, result.Edges); err != nil {
+	if _, err := graph.Rebuild(paths, cfg, result.Nodes); err != nil {
 		t.Fatalf("rebuild: %v", err)
 	}
 
@@ -107,9 +110,9 @@ func structuredOf[T any](t *testing.T, res *sdk.CallToolResult) T {
 	return out
 }
 
-// Bloated tool sets are a leading agent failure mode, so the count is asserted
-// rather than left to drift.
-func TestExactlyFiveToolsAreRegistered(t *testing.T) {
+// Bloated tool sets are a leading agent failure mode, so the surface is
+// asserted rather than left to drift.
+func TestToolSurfaceIsFixed(t *testing.T) {
 	session, ctx, _ := newMCPProject(t)
 
 	list, err := session.ListTools(ctx, nil)
@@ -118,8 +121,9 @@ func TestExactlyFiveToolsAreRegistered(t *testing.T) {
 	}
 
 	want := map[string]bool{
-		"repo_map": true, "symbol_find": true, "symbol_read": true,
-		"remember": true, "graph_status": true,
+		"repo_brief": true, "repo_changes": true, "repo_map": true,
+		"symbol_find": true, "symbol_read": true,
+		"remember": true, "memor_status": true,
 	}
 	if len(list.Tools) != len(want) {
 		t.Errorf("expected %d tools, got %d", len(want), len(list.Tools))
@@ -221,7 +225,7 @@ func TestRememberBindsAFactToAFile(t *testing.T) {
 		t.Errorf("unexpected type %q", out.Type)
 	}
 
-	// The point of an explains edge is that the fact resurfaces on the file it
+	// The point of attaching a memory is that it resurfaces on the file it
 	// explains, without anyone searching for it.
 	mapRes := callTool(t, session, ctx, "repo_map", map[string]any{"query": "session token validation"})
 	if !strings.Contains(textOf(mapRes), "rotating key set") {
@@ -270,23 +274,23 @@ func TestRememberRejectsSummaryWithoutExactlyOneFile(t *testing.T) {
 	}
 }
 
-func TestGraphStatusReportsFreshness(t *testing.T) {
+func TestStatusReportsFreshness(t *testing.T) {
 	session, ctx, dir := newMCPProject(t)
 
-	out := structuredOf[mcp.StatusOutput](t, callTool(t, session, ctx, "graph_status", map[string]any{}))
+	out := structuredOf[mcp.StatusOutput](t, callTool(t, session, ctx, "memor_status", map[string]any{}))
 	if out.Nodes == 0 {
-		t.Fatal("expected an indexed graph")
+		t.Fatal("expected an indexed repository")
 	}
 	if out.Stale != 0 {
 		t.Errorf("expected nothing stale immediately after a build, got %d", out.Stale)
 	}
-	if !strings.Contains(out.Advice, "repo_map") {
+	if !strings.Contains(out.Advice, "repo_") {
 		t.Errorf("expected advice pointing at the next action, got %q", out.Advice)
 	}
 
-	// A stale graph is worse than no graph, so drift must be reported.
+	// A stale index is worse than no index, so drift must be reported.
 	writeFile(t, dir, "internal/auth/session.go", "package auth\n\nfunc ValidateToken(token string) error { return nil }\n")
-	drifted := structuredOf[mcp.StatusOutput](t, callTool(t, session, ctx, "graph_status", map[string]any{}))
+	drifted := structuredOf[mcp.StatusOutput](t, callTool(t, session, ctx, "memor_status", map[string]any{}))
 	if drifted.Stale == 0 {
 		t.Error("expected the edited file to be reported as stale")
 	}
@@ -295,11 +299,74 @@ func TestGraphStatusReportsFreshness(t *testing.T) {
 	}
 }
 
+// repo_brief is what every session starts with, so it has to stay cheap. If it
+// ever costs as much as reading a file, the agent has no reason to prefer it.
+func TestBriefIsCheapAndOrienting(t *testing.T) {
+	session, ctx, _ := newMCPProject(t)
+
+	brief := structuredOf[sessionpkg.Brief](t, callTool(t, session, ctx, "repo_brief", map[string]any{}))
+	if brief.Files == 0 {
+		t.Fatal("expected an indexed repository")
+	}
+	if !brief.FirstVisit {
+		t.Error("expected the first call to report a first visit")
+	}
+	if brief.Advice == "" {
+		t.Error("the brief must always say what to do next")
+	}
+	if len(brief.Layout) == 0 {
+		t.Error("expected a top-level layout")
+	}
+
+	encoded, err := json.Marshal(brief)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cost := token.Count(string(encoded)); cost > constants.DefaultBriefBudget {
+		t.Errorf("brief cost %d tokens, over the %d budget:\n%s",
+			cost, constants.DefaultBriefBudget, encoded)
+	}
+}
+
+// The second visit is the one that matters: an agent that already saw the
+// repository must be told so rather than handed the same map again.
+func TestBriefAdvancesTheWatermark(t *testing.T) {
+	session, ctx, _ := newMCPProject(t)
+
+	args := map[string]any{"agent": "test-agent"}
+	first := structuredOf[sessionpkg.Brief](t, callTool(t, session, ctx, "repo_brief", args))
+	second := structuredOf[sessionpkg.Brief](t, callTool(t, session, ctx, "repo_brief", args))
+
+	if !first.FirstVisit {
+		t.Error("expected the first call to be a first visit")
+	}
+	if second.FirstVisit {
+		t.Error("expected the watermark to persist across calls")
+	}
+}
+
+func TestChangesReportsEditedFiles(t *testing.T) {
+	session, ctx, dir := newMCPProject(t)
+
+	writeFile(t, dir, "internal/auth/session.go", "package auth\n\nfunc ValidateToken(token string) error { return nil }\n")
+
+	set := structuredOf[sessionpkg.ChangeSet](t, callTool(t, session, ctx, "repo_changes", map[string]any{}))
+	found := false
+	for _, c := range set.Changes {
+		if c.Path == "internal/auth/session.go" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected the edited file to be listed, got %+v", set.Changes)
+	}
+}
+
 func TestUninitializedProjectReportsAnActionableError(t *testing.T) {
 	session, ctx := connectMCP(t, t.TempDir())
 
 	res, err := session.CallTool(ctx, &sdk.CallToolParams{
-		Name:      "graph_status",
+		Name:      "memor_status",
 		Arguments: map[string]any{},
 	})
 	if err != nil {

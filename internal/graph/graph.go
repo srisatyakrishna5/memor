@@ -5,35 +5,43 @@ import (
 	"strings"
 )
 
-// edgeKey identifies an edge uniquely so repeated extraction collapses instead
-// of accumulating parallel duplicates.
-type edgeKey struct {
-	from string
-	to   string
-	kind EdgeKind
-}
-
 // Graph is the in-memory projection of graph.snap plus graph.log.
 //
-// It is a plain adjacency structure with no query engine and no persistence of
-// its own: callers load it, use it, and drop it. That is what keeps memor a
-// bounded one-shot command rather than a database.
+// It is a flat node set with no adjacency and no persistence of its own:
+// callers load it, use it, and drop it. Relations live in node metadata, so
+// there is nothing here to traverse and no way for a query to expand beyond
+// what it matched.
 type Graph struct {
 	nodes   map[string]*Node
-	edges   map[edgeKey]*Edge
-	out     map[string][]*Edge
-	in      map[string][]*Edge
 	BuiltAt int64
+
+	// explains is the only reverse lookup kept, because rendering a file needs
+	// the memories attached to it and scanning every memory per file is
+	// quadratic. It is rebuilt on demand and dropped on any mutation.
+	explains map[string][]*Node
 }
 
 // New returns an empty graph.
 func New() *Graph {
-	return &Graph{
-		nodes: make(map[string]*Node),
-		edges: make(map[edgeKey]*Edge),
-		out:   make(map[string][]*Edge),
-		in:    make(map[string][]*Edge),
+	return &Graph{nodes: make(map[string]*Node)}
+}
+
+// explainIndex maps a node ID onto the memories that reference it.
+func (g *Graph) explainIndex() map[string][]*Node {
+	if g.explains != nil {
+		return g.explains
 	}
+	index := make(map[string][]*Node)
+	for _, n := range g.nodes {
+		if n.Kind != KindMem {
+			continue
+		}
+		for _, target := range n.MetaList(MetaExplains) {
+			index[target] = append(index[target], n)
+		}
+	}
+	g.explains = index
+	return index
 }
 
 // AddNode inserts or replaces a node. Replacement merges metadata so an
@@ -42,6 +50,7 @@ func (g *Graph) AddNode(n *Node) {
 	if n == nil || n.ID == "" {
 		return
 	}
+	g.explains = nil
 	existing, ok := g.nodes[n.ID]
 	if !ok {
 		clone := *n
@@ -86,99 +95,20 @@ func copyMeta(m map[string]string) map[string]string {
 	return out
 }
 
-// AddEdge inserts an edge, keeping the highest weight seen for a given triple.
-// Edges pointing at nodes that do not exist are dropped: a dangling edge is a
-// distractor waiting to happen.
-func (g *Graph) AddEdge(e Edge) {
-	if e.From == "" || e.To == "" || e.From == e.To {
-		return
-	}
-	key := edgeKey{e.From, e.To, e.Kind}
-	if existing, ok := g.edges[key]; ok {
-		if e.W > existing.W {
-			existing.W = e.W
-		}
-		return
-	}
-	stored := e
-	if stored.W == 0 {
-		stored.W = 1
-	}
-	g.edges[key] = &stored
-	g.out[e.From] = append(g.out[e.From], &stored)
-	g.in[e.To] = append(g.in[e.To], &stored)
-}
-
-// RemoveNode deletes a node and every edge incident to it.
+// RemoveNode deletes a node.
 func (g *Graph) RemoveNode(id string) {
-	if _, ok := g.nodes[id]; !ok {
-		return
-	}
 	delete(g.nodes, id)
-	for key := range g.edges {
-		if key.from == id || key.to == id {
-			delete(g.edges, key)
-		}
-	}
-	g.reindexAdjacency()
+	g.explains = nil
 }
 
-// RemoveEdge deletes a single relation.
-func (g *Graph) RemoveEdge(from, to string, kind EdgeKind) {
-	key := edgeKey{from, to, kind}
-	if _, ok := g.edges[key]; !ok {
-		return
-	}
-	delete(g.edges, key)
-	g.reindexAdjacency()
-}
-
-// PruneExtracted drops every machine-derived node and its edges. A rebuild runs
-// this first so deleted files and renamed symbols cannot linger as ghosts.
+// PruneExtracted drops every machine-derived node. A rebuild runs this first so
+// deleted files and renamed symbols cannot linger as ghosts.
 func (g *Graph) PruneExtracted() {
+	g.explains = nil
 	for id, n := range g.nodes {
 		if n.Origin() == OriginExtract {
 			delete(g.nodes, id)
 		}
-	}
-	for key, e := range g.edges {
-		switch e.Kind {
-		case EdgeImports, EdgeContains, EdgeCalls, EdgeRefs:
-			delete(g.edges, key)
-		default:
-			if _, ok := g.nodes[key.from]; !ok {
-				delete(g.edges, key)
-				continue
-			}
-			if _, ok := g.nodes[key.to]; !ok {
-				delete(g.edges, key)
-			}
-		}
-	}
-	g.reindexAdjacency()
-}
-
-// Resolve drops edges whose endpoints no longer exist. Callers run it after a
-// bulk load so retrieval never walks into a missing node.
-func (g *Graph) Resolve() {
-	for key := range g.edges {
-		if _, ok := g.nodes[key.from]; !ok {
-			delete(g.edges, key)
-			continue
-		}
-		if _, ok := g.nodes[key.to]; !ok {
-			delete(g.edges, key)
-		}
-	}
-	g.reindexAdjacency()
-}
-
-func (g *Graph) reindexAdjacency() {
-	g.out = make(map[string][]*Edge, len(g.out))
-	g.in = make(map[string][]*Edge, len(g.in))
-	for _, e := range g.edges {
-		g.out[e.From] = append(g.out[e.From], e)
-		g.in[e.To] = append(g.in[e.To], e)
 	}
 }
 
@@ -191,24 +121,13 @@ func (g *Graph) Node(id string) (*Node, bool) {
 // NodeCount returns the number of nodes.
 func (g *Graph) NodeCount() int { return len(g.nodes) }
 
-// EdgeCount returns the number of edges.
-func (g *Graph) EdgeCount() int { return len(g.edges) }
-
 // Nodes returns every node in a stable order.
 func (g *Graph) Nodes() []*Node {
 	out := make([]*Node, 0, len(g.nodes))
 	for _, n := range g.nodes {
 		out = append(out, n)
 	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].Kind != out[j].Kind {
-			return out[i].Kind < out[j].Kind
-		}
-		if out[i].Name != out[j].Name {
-			return out[i].Name < out[j].Name
-		}
-		return out[i].ID < out[j].ID
-	})
+	sortNodes(out)
 	return out
 }
 
@@ -220,13 +139,20 @@ func (g *Graph) NodesOfKind(k Kind) []*Node {
 			out = append(out, n)
 		}
 	}
+	sortNodes(out)
+	return out
+}
+
+func sortNodes(out []*Node) {
 	sort.Slice(out, func(i, j int) bool {
+		if out[i].Kind != out[j].Kind {
+			return out[i].Kind < out[j].Kind
+		}
 		if out[i].Name != out[j].Name {
 			return out[i].Name < out[j].Name
 		}
 		return out[i].ID < out[j].ID
 	})
-	return out
 }
 
 // CountByKind reports how many nodes exist per kind.
@@ -236,51 +162,6 @@ func (g *Graph) CountByKind() map[string]int {
 		counts[n.Kind.String()]++
 	}
 	return counts
-}
-
-// Edges returns every edge in a stable order.
-func (g *Graph) Edges() []Edge {
-	out := make([]Edge, 0, len(g.edges))
-	for _, e := range g.edges {
-		out = append(out, *e)
-	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].From != out[j].From {
-			return out[i].From < out[j].From
-		}
-		if out[i].Kind != out[j].Kind {
-			return out[i].Kind < out[j].Kind
-		}
-		return out[i].To < out[j].To
-	})
-	return out
-}
-
-// Out returns edges leaving a node.
-func (g *Graph) Out(id string) []*Edge { return g.out[id] }
-
-// In returns edges entering a node. The reverse direction answers "what breaks
-// if I change this?", which is what agents most often need, so it is kept
-// precomputed rather than derived per query.
-func (g *Graph) In(id string) []*Edge { return g.in[id] }
-
-// Neighbors returns the IDs reachable from id in either direction.
-func (g *Graph) Neighbors(id string) []string {
-	seen := make(map[string]struct{})
-	var out []string
-	for _, e := range g.out[id] {
-		if _, ok := seen[e.To]; !ok {
-			seen[e.To] = struct{}{}
-			out = append(out, e.To)
-		}
-	}
-	for _, e := range g.in[id] {
-		if _, ok := seen[e.From]; !ok {
-			seen[e.From] = struct{}{}
-			out = append(out, e.From)
-		}
-	}
-	return out
 }
 
 // FindFile returns the file node for a project-relative path.
@@ -317,39 +198,78 @@ func (g *Graph) FindSymbols(name string) []*Node {
 		if result[i].Name != result[j].Name {
 			return result[i].Name < result[j].Name
 		}
-		return spanPath(result[i]) < spanPath(result[j])
+		return SpanPath(result[i]) < SpanPath(result[j])
 	})
 	return result
 }
 
-func spanPath(n *Node) string {
+// SymbolsIn returns the symbol nodes defined in a file, ordered by position.
+func (g *Graph) SymbolsIn(path string) []*Node {
+	var out []*Node
+	for _, n := range g.nodes {
+		if n.Kind == KindSym && SpanPath(n) == path {
+			out = append(out, n)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		li, lj := lineOf(out[i]), lineOf(out[j])
+		if li != lj {
+			return li < lj
+		}
+		return out[i].Name < out[j].Name
+	})
+	return out
+}
+
+func lineOf(n *Node) int {
 	if n.Span == nil {
+		return 0
+	}
+	return n.Span.L0
+}
+
+// SpanPath returns the file a node's span points at, or "".
+func SpanPath(n *Node) string {
+	if n == nil || n.Span == nil {
 		return ""
 	}
 	return n.Span.Path
 }
 
-// TopicIDs maps tag names onto topic node IDs, creating none.
-func (g *Graph) TopicIDs(tags []string) []string {
-	var out []string
-	for _, t := range tags {
-		id := NodeID(KindTopic, strings.ToLower(strings.TrimSpace(strings.TrimPrefix(t, "#"))))
-		if _, ok := g.nodes[id]; ok {
-			out = append(out, id)
-		}
-	}
+// Explaining returns the memories attached to a node.
+func (g *Graph) Explaining(id string) []*Node {
+	out := append([]*Node(nil), g.explainIndex()[id]...)
+	sort.Slice(out, func(i, j int) bool { return out[i].T > out[j].T })
 	return out
 }
 
-// Tags returns the topic names attached to a node.
-func (g *Graph) Tags(id string) []string {
-	var out []string
-	for _, e := range g.out[id] {
-		if e.Kind != EdgeTagged {
-			continue
+// AllTags returns every tag name in use, sorted.
+func (g *Graph) AllTags() []string {
+	var all []string
+	for _, n := range g.nodes {
+		all = append(all, n.Tags()...)
+	}
+	return DedupeSorted(all)
+}
+
+// NodesTagged returns the IDs of nodes carrying any of the given tags.
+func (g *Graph) NodesTagged(tags []string) []string {
+	if len(tags) == 0 {
+		return nil
+	}
+	want := make(map[string]struct{}, len(tags))
+	for _, t := range tags {
+		if norm := NormalizeTag(t); norm != "" {
+			want[norm] = struct{}{}
 		}
-		if topic, ok := g.nodes[e.To]; ok {
-			out = append(out, topic.Name)
+	}
+	var out []string
+	for id, n := range g.nodes {
+		for _, t := range n.Tags() {
+			if _, ok := want[t]; ok {
+				out = append(out, id)
+				break
+			}
 		}
 	}
 	sort.Strings(out)

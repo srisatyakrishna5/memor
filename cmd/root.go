@@ -13,13 +13,13 @@ var Version = "dev"
 
 var rootCmd = &cobra.Command{
 	Use:   "memor",
-	Short: "Repository knowledge graph and persistent memory for AI coding assistants",
-	Long: `Memor — a repository-native knowledge graph and memory store.
+	Short: "Persistent repository state and memory for AI coding assistants",
+	Long: `Memor — a repository-native state and memory store.
 
 It lives in .memor/ inside your project (gitignored), indexes your files,
-symbols, dependencies, and docs into one graph, records what past conversations
-learned, and hands an AI assistant a task-ranked map within a token budget
-instead of making it read files to find out where anything is.`,
+symbols, dependencies and docs, tracks what changed since an agent last looked,
+and records what past conversations learned. An assistant reads a few hundred
+tokens to know where it stands instead of reading the codebase to find out.`,
 	SilenceUsage: true,
 }
 
@@ -34,13 +34,14 @@ func Execute() {
 func init() {
 	rootCmd.AddCommand(initCmd)
 	rootCmd.AddCommand(buildCmd)
+	rootCmd.AddCommand(briefCmd)
+	rootCmd.AddCommand(changesCmd)
 	rootCmd.AddCommand(statusCmd)
 	rootCmd.AddCommand(contextCmd)
 	rootCmd.AddCommand(rememberCmd)
 	rootCmd.AddCommand(searchCmd)
 	rootCmd.AddCommand(symbolCmd)
 	rootCmd.AddCommand(compactCmd)
-	rootCmd.AddCommand(migrateCmd)
 	rootCmd.AddCommand(exportCmd)
 	rootCmd.AddCommand(importCmd)
 	rootCmd.AddCommand(cleanCmd)

@@ -70,19 +70,14 @@ func runSymbolFind(cmd *cobra.Command, args []string) error {
 		}
 		fmt.Printf("%s  %s  [%s]\n", location, n.Text, graph.FileStatus(sess.Root, n))
 
-		if callers := namesOf(g, n.ID, graph.EdgeCalls, false); len(callers) > 0 {
+		if callers := n.MetaList(graph.MetaCallers); len(callers) > 0 {
 			fmt.Printf("  <- %s\n", strings.Join(callers, ", "))
 		}
-		if callees := namesOf(g, n.ID, graph.EdgeCalls, true); len(callees) > 0 {
+		if callees := n.MetaList(graph.MetaCalls); len(callees) > 0 {
 			fmt.Printf("  -> %s\n", strings.Join(callees, ", "))
 		}
-		for _, e := range g.In(n.ID) {
-			if e.Kind != graph.EdgeExplains {
-				continue
-			}
-			if note, ok := g.Node(e.From); ok {
-				fmt.Printf("  ~ %s\n", collapseLine(note.Text, 140))
-			}
+		for _, note := range g.Explaining(n.ID) {
+			fmt.Printf("  ~ %s\n", collapseLine(note.Text, 140))
 		}
 	}
 	return nil
@@ -149,26 +144,4 @@ func parseLineRange(s string) (int, int, error) {
 		}
 	}
 	return first, last, nil
-}
-
-func namesOf(g *graph.Graph, id string, kind graph.EdgeKind, outgoing bool) []string {
-	edges := g.In(id)
-	if outgoing {
-		edges = g.Out(id)
-	}
-
-	var out []string
-	for _, e := range edges {
-		if e.Kind != kind {
-			continue
-		}
-		other := e.From
-		if outgoing {
-			other = e.To
-		}
-		if n, ok := g.Node(other); ok {
-			out = append(out, n.Name)
-		}
-	}
-	return out
 }

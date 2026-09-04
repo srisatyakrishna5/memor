@@ -9,38 +9,24 @@ import (
 )
 
 // Log operations. graph.log is the only append target in .memor/; every write
-// in the system is one of these four records.
+// in the system is one of these two records.
 const (
 	OpNode     = "n"
-	OpEdge     = "e"
 	OpDropNode = "-n"
-	OpDropEdge = "-e"
 )
 
 // Record is one line of graph.log or graph.snap.
 type Record struct {
-	Op   string    `json:"o"`
-	Node *Node     `json:"n,omitempty"`
-	Edge *Edge     `json:"g,omitempty"`
-	ID   string    `json:"i,omitempty"` // node tombstone target
-	From string    `json:"f,omitempty"` // edge tombstone
-	To   string    `json:"t,omitempty"`
-	Kind *EdgeKind `json:"k,omitempty"`
+	Op   string `json:"o"`
+	Node *Node  `json:"n,omitempty"`
+	ID   string `json:"i,omitempty"` // node tombstone target
 }
 
 // NodeRecord wraps a node for the log.
 func NodeRecord(n *Node) Record { return Record{Op: OpNode, Node: n} }
 
-// EdgeRecord wraps an edge for the log.
-func EdgeRecord(e Edge) Record { return Record{Op: OpEdge, Edge: &e} }
-
 // DropNodeRecord tombstones a node.
 func DropNodeRecord(id string) Record { return Record{Op: OpDropNode, ID: id} }
-
-// DropEdgeRecord tombstones an edge.
-func DropEdgeRecord(from, to string, kind EdgeKind) Record {
-	return Record{Op: OpDropEdge, From: from, To: to, Kind: &kind}
-}
 
 // Encode marshals records to newline-free JSON lines.
 func Encode(records []Record) ([][]byte, error) {
@@ -114,30 +100,18 @@ func Apply(g *Graph, records []Record) {
 		switch rec.Op {
 		case OpNode:
 			g.AddNode(rec.Node)
-		case OpEdge:
-			if rec.Edge != nil {
-				g.AddEdge(*rec.Edge)
-			}
 		case OpDropNode:
 			g.RemoveNode(rec.ID)
-		case OpDropEdge:
-			if rec.Kind != nil {
-				g.RemoveEdge(rec.From, rec.To, *rec.Kind)
-			}
 		}
 	}
 }
 
-// Snapshot serializes a graph as canonical records: every node, then every edge.
+// Snapshot serializes a graph as canonical node records.
 func Snapshot(g *Graph) []Record {
 	nodes := g.Nodes()
-	edges := g.Edges()
-	records := make([]Record, 0, len(nodes)+len(edges))
+	records := make([]Record, 0, len(nodes))
 	for _, n := range nodes {
 		records = append(records, NodeRecord(n))
-	}
-	for _, e := range edges {
-		records = append(records, EdgeRecord(e))
 	}
 	return records
 }

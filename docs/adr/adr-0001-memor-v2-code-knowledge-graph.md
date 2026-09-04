@@ -1,12 +1,19 @@
 ---
 title: "ADR-0001: Rewrite .memor as a Repository-Native Code Knowledge Graph"
-status: "Accepted"
+status: "Superseded"
 date: "2026-09-03"
 authors: "Memor maintainers"
 tags: ["architecture", "decision", "knowledge-graph", "token-efficiency", "storage"]
 supersedes: ""
-superseded_by: ""
+superseded_by: "ADR-0002"
 ---
+
+> **Superseded by [ADR-0002](adr-0002-static-repo-state.md).** The graph model,
+> typed edges, BFS expansion and PageRank described below were built, shipped,
+> and then removed: they answered a question agents were not asking, while the
+> signal that actually mattered — what changed since the agent last looked — was
+> missing. The evidence base, the storage rules, the span model and the
+> precision-over-recall stance in this document all still hold.
 
 ## Status
 

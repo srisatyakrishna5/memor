@@ -3,11 +3,10 @@
 // Creates .memor/, gitignores it, registers the MCP server, and drops a
 // three-line pointer into AGENTS.md.
 //
-// v2 owns two files outside .memor/ instead of seven. Behavioural rules live in
-// the MCP tool descriptions rather than a markdown template: they load with the
-// tool, cannot be edited away, and are versioned with the binary. The only
-// reason AGENTS.md exists at all is that Copilot cannot be told to read a file
-// it does not already know about.
+// Behavioural rules live in the MCP tool descriptions rather than a markdown
+// template: they load with the tool, cannot be edited away, and are versioned
+// with the binary. The only reason AGENTS.md exists at all is that Copilot
+// cannot be told to read a file it does not already know about.
 //
 // Flags:
 //
@@ -48,13 +47,13 @@ const (
 // agentsPointer is deliberately three lines. Everything an agent needs to know
 // about how to behave is in the tool descriptions; duplicating it here would
 // only create a second copy to drift.
-const agentsPointer = `This repo uses memor for its repository map and project memory.
-Call ` + "`repo_map`" + ` before reading or searching any file; use ` + "`symbol_find`" + ` instead of grep
-and ` + "`symbol_read`" + ` instead of whole-file reads. Full protocol: run ` + "`memor rules`" + `.`
+const agentsPointer = `This repo uses memor for its repository state and project memory.
+Call ` + "`repo_brief`" + ` first in every conversation, before reading or searching anything.
+Then ` + "`repo_map`" + `, ` + "`symbol_find`" + `, ` + "`symbol_read`" + `. Full protocol: run ` + "`memor rules`" + `.`
 
 var initCmd = &cobra.Command{
 	Use:   "init",
-	Short: "Initialize the knowledge graph in the current project",
+	Short: "Initialize memor in the current project",
 	Args:  cobra.NoArgs,
 	RunE:  runInit,
 }
@@ -94,7 +93,7 @@ func runInit(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return err
 		}
-		fmt.Printf("Indexed %d files, %d symbols, %d edges\n", report.Files, report.Symbols, report.Edges)
+		fmt.Printf("Indexed %d files, %d symbols\n", report.Files, report.Symbols)
 		return nil
 	}
 

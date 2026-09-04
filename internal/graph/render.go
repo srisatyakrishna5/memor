@@ -2,6 +2,7 @@ package graph
 
 import (
 	"fmt"
+	"path"
 	"sort"
 	"strings"
 	"time"
@@ -14,7 +15,7 @@ import (
 // map of the repository.
 //
 // Nothing parses this format back. It is write-only output, which is precisely
-// why v2 has no bespoke DSL parser to keep in sync with the writer.
+// why memor has no bespoke DSL parser to keep in sync with the writer.
 func Render(g *Graph, cfg config.Config) string {
 	var sb strings.Builder
 
@@ -23,9 +24,9 @@ func Render(g *Graph, cfg config.Config) string {
 	if built == 0 {
 		built = time.Now().Unix()
 	}
-	fmt.Fprintf(&sb, "@g v2 | %d files | %d symbols | %d docs | %d memories | %d edges | built:%s\n",
+	fmt.Fprintf(&sb, "@g v3 | %d files | %d symbols | %d docs | %d memories | built:%s\n",
 		counts[KindFile.String()], counts[KindSym.String()], counts[KindDoc.String()],
-		counts[KindMem.String()], g.EdgeCount(),
+		counts[KindMem.String()],
 		time.Unix(built, 0).UTC().Format(time.RFC3339))
 
 	files := g.NodesOfKind(KindFile)
@@ -61,17 +62,17 @@ func RenderFile(g *Graph, f *Node, maxSymbols int) string {
 		hash = f.Span.Hash
 	}
 	header := fmt.Sprintf("@f %s [%s LOC | %s]", f.Name, orDash(f.MetaValue(MetaLOC)), orDash(hash))
-	if pkg := packageOf(g, f); pkg != "" {
+	if pkg := f.MetaValue(MetaPkg); pkg != "" {
 		header += " pkg:" + pkg
 	}
 	sb.WriteString(header)
 	sb.WriteByte('\n')
 
-	if f.Text != "" {
-		fmt.Fprintf(&sb, "  : %s\n", f.Text)
+	if purpose := fileSummary(f); purpose != "" {
+		fmt.Fprintf(&sb, "  : %s\n", purpose)
 	}
 
-	symbols := containedSymbols(g, f)
+	symbols := g.SymbolsIn(f.Name)
 	shown := symbols
 	if maxSymbols > 0 && len(shown) > maxSymbols {
 		shown = shown[:maxSymbols]
@@ -91,15 +92,15 @@ func RenderFile(g *Graph, f *Node, maxSymbols int) string {
 		fmt.Fprintf(&sb, "  ... %d more symbols\n", len(symbols)-len(shown))
 	}
 
-	if deps := edgeTargets(g, f.ID, EdgeImports, true); len(deps) > 0 {
+	if deps := f.MetaList(MetaImports); len(deps) > 0 {
 		fmt.Fprintf(&sb, "  -> %s\n", strings.Join(deps, ", "))
 	}
 	// The reverse direction answers "what breaks if I change this?", which is
 	// the question agents actually ask, and it is free to precompute.
-	if dependents := edgeTargets(g, f.ID, EdgeImports, false); len(dependents) > 0 {
+	if dependents := f.MetaList(MetaDependents); len(dependents) > 0 {
 		fmt.Fprintf(&sb, "  <- %s\n", strings.Join(dependents, ", "))
 	}
-	if tags := g.Tags(f.ID); len(tags) > 0 {
+	if tags := f.Tags(); len(tags) > 0 {
 		fmt.Fprintf(&sb, "  # %s\n", strings.Join(tags, " "))
 	}
 
@@ -132,10 +133,11 @@ func RenderDoc(g *Graph, d *Node) string {
 func RenderMemory(g *Graph, m *Node) string {
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "@%s", m.MemType())
-	if tags := g.Tags(m.ID); len(tags) > 0 {
-		for _, t := range tags {
-			sb.WriteString(" #" + t)
-		}
+	for _, t := range m.Tags() {
+		sb.WriteString(" #" + t)
+	}
+	if task := m.MetaValue(MetaTask); task != "" {
+		fmt.Fprintf(&sb, " [%s/%s]", task, orDash(m.MetaValue(MetaStatus)))
 	}
 	fmt.Fprintf(&sb, ": %s [%s]\n", collapse(m.Text), datestamp(m))
 	return sb.String()
@@ -166,111 +168,78 @@ func orDash(s string) string {
 	return s
 }
 
-func packageOf(g *Graph, f *Node) string {
-	if pkg := f.MetaValue(MetaPkg); pkg != "" {
-		return pkg
+// fileSummary prefers an agent-authored summary and falls back to the purpose
+// line extraction derived from the file's own leading comment.
+func fileSummary(f *Node) string {
+	if f.Text != "" {
+		return f.Text
 	}
-	for _, e := range g.In(f.ID) {
-		if e.Kind != EdgeContains {
-			continue
-		}
-		if n, ok := g.Node(e.From); ok && n.Kind == KindPkg {
-			return n.Name
-		}
-	}
-	return ""
-}
-
-func containedSymbols(g *Graph, f *Node) []*Node {
-	var out []*Node
-	for _, e := range g.Out(f.ID) {
-		if e.Kind != EdgeContains {
-			continue
-		}
-		if n, ok := g.Node(e.To); ok && n.Kind == KindSym {
-			out = append(out, n)
-		}
-	}
-	sort.Slice(out, func(i, j int) bool {
-		li, lj := 0, 0
-		if out[i].Span != nil {
-			li = out[i].Span.L0
-		}
-		if out[j].Span != nil {
-			lj = out[j].Span.L0
-		}
-		if li != lj {
-			return li < lj
-		}
-		return out[i].Name < out[j].Name
-	})
-	return out
-}
-
-func edgeTargets(g *Graph, id string, kind EdgeKind, outgoing bool) []string {
-	var edges []*Edge
-	if outgoing {
-		edges = g.Out(id)
-	} else {
-		edges = g.In(id)
-	}
-
-	var names []string
-	seen := make(map[string]struct{})
-	for _, e := range edges {
-		if e.Kind != kind {
-			continue
-		}
-		other := e.To
-		if !outgoing {
-			other = e.From
-		}
-		n, ok := g.Node(other)
-		if !ok {
-			continue
-		}
-		if _, dup := seen[n.Name]; dup {
-			continue
-		}
-		seen[n.Name] = struct{}{}
-		names = append(names, n.Name)
-	}
-	sort.Strings(names)
-	return names
+	return f.MetaValue(MetaPurpose)
 }
 
 func explainingMemories(g *Graph, targetID string) []*Node {
-	var out []*Node
-	for _, e := range g.In(targetID) {
-		if e.Kind != EdgeExplains {
-			continue
-		}
-		if n, ok := g.Node(e.From); ok && n.Kind == KindMem {
-			out = append(out, n)
-		}
-	}
+	out := append([]*Node(nil), g.explainIndex()[targetID]...)
 	sort.Slice(out, func(i, j int) bool { return out[i].T > out[j].T })
 	return out
 }
 
-// looseMemories returns memories that explain nothing, so they still surface
-// in the projection rather than vanishing between file blocks.
+// looseMemories returns memories attached to nothing, so they still surface in
+// the projection rather than vanishing between file blocks.
 func looseMemories(g *Graph) []*Node {
 	var out []*Node
 	for _, m := range g.NodesOfKind(KindMem) {
-		attached := false
-		for _, e := range g.Out(m.ID) {
-			if e.Kind == EdgeExplains {
-				attached = true
-				break
-			}
-		}
-		if !attached {
+		if len(m.MetaList(MetaExplains)) == 0 {
 			out = append(out, m)
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].T > out[j].T })
 	return out
+}
+
+// RenderManifest produces the cheapest useful view of a repository: one line
+// per file, grouped by directory, with symbol names but no signatures.
+//
+// This is what an agent reads first. Every field it carries has to earn its
+// tokens, so bodies, spans, imports and hashes are all deliberately absent.
+func RenderManifest(g *Graph, maxSymbols int) string {
+	byDir := make(map[string][]*Node)
+	for _, f := range g.NodesOfKind(KindFile) {
+		dir := f.MetaValue(MetaPkg)
+		if dir == "" {
+			dir = "(root)"
+		}
+		byDir[dir] = append(byDir[dir], f)
+	}
+
+	dirs := make([]string, 0, len(byDir))
+	for dir := range byDir {
+		dirs = append(dirs, dir)
+	}
+	sort.Strings(dirs)
+
+	var sb strings.Builder
+	for _, dir := range dirs {
+		fmt.Fprintf(&sb, "%s/\n", dir)
+		for _, f := range byDir[dir] {
+			fmt.Fprintf(&sb, "  %s", path.Base(f.Name))
+			if purpose := fileSummary(f); purpose != "" {
+				fmt.Fprintf(&sb, " — %s", collapse(purpose))
+			}
+			sb.WriteByte('\n')
+			if syms := f.MetaList(MetaSymbols); len(syms) > 0 && maxSymbols != 0 {
+				shown := syms
+				if maxSymbols > 0 && len(shown) > maxSymbols {
+					shown = shown[:maxSymbols]
+				}
+				fmt.Fprintf(&sb, "    %s", strings.Join(shown, " "))
+				if len(syms) > len(shown) {
+					fmt.Fprintf(&sb, " +%d", len(syms)-len(shown))
+				}
+				sb.WriteByte('\n')
+			}
+		}
+	}
+	return sb.String()
 }
 
 // RenderToFile writes the projection to graph.db.

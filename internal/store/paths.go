@@ -9,28 +9,18 @@ import (
 //
 // Only LogFile is ever appended to, and only SnapFile is lossless. DBFile is a
 // write-only projection for humans and agents; nothing parses it back, which is
-// why v2 has no bespoke DSL parser. IdxFile is derived and safe to delete at
-// any time.
+// why memor has no bespoke DSL parser.
 const (
 	DirName     = ".memor"
 	LogFile     = "graph.log"
 	SnapFile    = "graph.snap"
 	DBFile      = "graph.db"
-	IdxFile     = "graph.idx"
 	ArchiveFile = "graph.archive"
+	StateFile   = "state.json"
+	MarksFile   = "marks.jsonl"
 	BlobsDir    = "blobs"
 	ConfigFile  = "config.toml"
 	LockFile    = ".lock"
-)
-
-// Legacy v1 filenames, read once by `memor migrate` and never written.
-const (
-	LegacyMemoryDBFile  = "memory.db"
-	LegacySnapshotFile  = "memory.snapshot.jsonl"
-	LegacyWALFile       = "memory.wal"
-	LegacyArchiveFile   = "memory.archive"
-	LegacyKnowledgeFile = "knowledge.db"
-	LegacyLockFile      = "lock"
 )
 
 // Paths holds resolved paths to all memor files for a project.
@@ -39,37 +29,28 @@ type Paths struct {
 	Log     string
 	Snap    string
 	DB      string
-	Idx     string
 	Archive string
+	State   string
+	Marks   string
 	Blobs   string
 	Config  string
 	Lock    string
-
-	LegacyMemoryDB  string
-	LegacySnapshot  string
-	LegacyWAL       string
-	LegacyArchive   string
-	LegacyKnowledge string
 }
 
 // ResolvePaths computes all paths relative to a project root.
 func ResolvePaths(projectRoot string) Paths {
 	root := filepath.Join(projectRoot, DirName)
 	return Paths{
-		Root:            root,
-		Log:             filepath.Join(root, LogFile),
-		Snap:            filepath.Join(root, SnapFile),
-		DB:              filepath.Join(root, DBFile),
-		Idx:             filepath.Join(root, IdxFile),
-		Archive:         filepath.Join(root, ArchiveFile),
-		Blobs:           filepath.Join(root, BlobsDir),
-		Config:          filepath.Join(root, ConfigFile),
-		Lock:            filepath.Join(root, LockFile),
-		LegacyMemoryDB:  filepath.Join(root, LegacyMemoryDBFile),
-		LegacySnapshot:  filepath.Join(root, LegacySnapshotFile),
-		LegacyWAL:       filepath.Join(root, LegacyWALFile),
-		LegacyArchive:   filepath.Join(root, LegacyArchiveFile),
-		LegacyKnowledge: filepath.Join(root, LegacyKnowledgeFile),
+		Root:    root,
+		Log:     filepath.Join(root, LogFile),
+		Snap:    filepath.Join(root, SnapFile),
+		DB:      filepath.Join(root, DBFile),
+		Archive: filepath.Join(root, ArchiveFile),
+		State:   filepath.Join(root, StateFile),
+		Marks:   filepath.Join(root, MarksFile),
+		Blobs:   filepath.Join(root, BlobsDir),
+		Config:  filepath.Join(root, ConfigFile),
+		Lock:    filepath.Join(root, LockFile),
 	}
 }
 
@@ -114,18 +95,7 @@ func (p *Paths) Exists() bool {
 	return err == nil && info.IsDir()
 }
 
-// HasLegacyStore reports whether a v1 store is present. A v2 command finding
-// one and no graph.log triggers migration.
-func (p *Paths) HasLegacyStore() bool {
-	for _, path := range []string{p.LegacySnapshot, p.LegacyMemoryDB, p.LegacyWAL, p.LegacyKnowledge} {
-		if _, err := os.Stat(path); err == nil {
-			return true
-		}
-	}
-	return false
-}
-
-// HasGraph reports whether a v2 store exists.
+// HasGraph reports whether a store exists.
 func (p *Paths) HasGraph() bool {
 	for _, path := range []string{p.Snap, p.Log} {
 		if _, err := os.Stat(path); err == nil {

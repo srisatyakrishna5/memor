@@ -1,8 +1,10 @@
 // build.go — memor build
 //
-// Extracts the repository into the graph: files, packages, imports, Go symbols
-// with exact spans, and knowledge sections. Agent-authored memories and file
-// summaries are preserved; only machine-derived nodes are replaced.
+// Indexes the repository: files, packages, imports, per-file purpose lines, Go
+// symbols with exact spans, and knowledge sections. It also records the commit
+// it indexed, which is what later answers "what changed since then?".
+// Agent-authored memories and file summaries are preserved; only
+// machine-derived nodes are replaced.
 //
 // Examples:
 //
@@ -48,9 +50,12 @@ func runBuild(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	fmt.Printf("Indexed %d files, %d symbols, %d docs, %d edges in %s\n",
-		report.Files, report.Symbols, report.Docs, report.Edges,
+	fmt.Printf("Indexed %d files, %d symbols, %d docs in %s\n",
+		report.Files, report.Symbols, report.Docs,
 		report.Duration.Round(1e6))
+	if report.Commit != "" {
+		fmt.Printf("At commit %s\n", shortSHA(report.Commit))
+	}
 	if report.Skipped > 0 {
 		fmt.Printf("Skipped %d files above the size limit\n", report.Skipped)
 	}

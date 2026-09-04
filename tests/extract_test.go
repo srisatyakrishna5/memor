@@ -10,18 +10,24 @@ import (
 	"github.com/memor-dev/memor/internal/graph/extract"
 )
 
-// buildGraph folds an extraction result into a resolved graph.
+// buildGraph folds an extraction result into a graph.
 func buildGraph(t *testing.T, result extract.Result) *graph.Graph {
 	t.Helper()
 	g := graph.New()
 	for _, n := range result.Nodes {
 		g.AddNode(n)
 	}
-	for _, e := range result.Edges {
-		g.AddEdge(e)
-	}
-	g.Resolve()
 	return g
+}
+
+// contains reports whether a metadata list holds a value.
+func contains(values []string, want string) bool {
+	for _, v := range values {
+		if v == want {
+			return true
+		}
+	}
+	return false
 }
 
 // extractConfig disables knowledge indexing so extraction tests see only code.
@@ -54,20 +60,23 @@ func TestRepoExtractsStructure(t *testing.T) {
 	}
 }
 
-// The standard library is universally imported, so modelling it would make fmt
-// the highest-ranked node in every repository while carrying no signal.
-func TestStdlibIsNotModelled(t *testing.T) {
+// The standard library is universally imported, so recording it would bury the
+// handful of imports that actually say something about a file.
+func TestStdlibIsNotRecorded(t *testing.T) {
 	root := sampleRepo(t)
 
 	result, err := extract.Repo(root, extractConfig())
 	if err != nil {
 		t.Fatalf("Repo: %v", err)
 	}
+	g := buildGraph(t, result)
 
-	for _, n := range result.Nodes {
-		if n.Kind == graph.KindExt && n.Name == "fmt" {
-			t.Error("expected the standard library to be excluded from the graph")
-		}
+	main, ok := g.FindFile("main.go")
+	if !ok {
+		t.Fatal("expected main.go")
+	}
+	if contains(main.MetaList(graph.MetaImports), "fmt") {
+		t.Error("expected the standard library to be excluded")
 	}
 }
 
@@ -85,30 +94,21 @@ func TestInternalImportResolvesToPackage(t *testing.T) {
 		t.Fatal("expected main.go")
 	}
 
-	var sawInternal, sawExternal bool
-	for _, e := range g.Out(main.ID) {
-		if e.Kind != graph.EdgeImports {
-			continue
-		}
-		target, ok := g.Node(e.To)
-		if !ok {
-			continue
-		}
-		switch {
-		case target.Kind == graph.KindPkg && target.Name == "internal/store":
-			sawInternal = true
-		case target.Kind == graph.KindExt && target.Name == "github.com/spf13/cobra":
-			sawExternal = true
-			if e.W >= 1 {
-				t.Errorf("expected external imports to be damped, got weight %v", e.W)
-			}
-		}
+	imports := main.MetaList(graph.MetaImports)
+	if !contains(imports, "internal/store") {
+		t.Errorf("expected the internal package to be recorded, got %v", imports)
 	}
-	if !sawInternal {
-		t.Error("expected an imports edge to the internal package")
+	if !contains(imports, "github.com/spf13/cobra") {
+		t.Errorf("expected the external module to be recorded, got %v", imports)
 	}
-	if !sawExternal {
-		t.Error("expected an imports edge to the external module")
+
+	// The reverse direction is what answers "what breaks if I change this?".
+	pkg, ok := g.Node(graph.NodeID(graph.KindPkg, "internal/store"))
+	if !ok {
+		t.Fatal("expected the internal package node")
+	}
+	if !contains(pkg.MetaList(graph.MetaDependents), "main.go") {
+		t.Errorf("expected main.go to be recorded as a dependent, got %v", pkg.MetaList(graph.MetaDependents))
 	}
 }
 
@@ -149,7 +149,7 @@ func TestGoSymbolSpansArePrecise(t *testing.T) {
 	}
 }
 
-func TestCallEdgesResolveWithinPackage(t *testing.T) {
+func TestCallsResolveWithinPackage(t *testing.T) {
 	root := sampleRepo(t)
 
 	result, err := extract.Repo(root, extractConfig())
@@ -163,17 +163,17 @@ func TestCallEdgesResolveWithinPackage(t *testing.T) {
 		t.Fatal("expected Load")
 	}
 
-	found := false
-	for _, e := range g.Out(load[0].ID) {
-		if e.Kind != graph.EdgeCalls {
-			continue
-		}
-		if target, ok := g.Node(e.To); ok && target.Name == "normalize" {
-			found = true
-		}
+	calls := load[0].MetaList(graph.MetaCalls)
+	if !contains(calls, "internal/store/store.go#normalize") {
+		t.Errorf("expected Load to record a call to normalize, got %v", calls)
 	}
-	if !found {
-		t.Error("expected a calls edge from Load to normalize")
+
+	normalize := g.FindSymbols("normalize")
+	if len(normalize) == 0 {
+		t.Fatal("expected normalize")
+	}
+	if !contains(normalize[0].MetaList(graph.MetaCallers), "internal/store/store.go#Load") {
+		t.Error("expected normalize to record Load as a caller")
 	}
 }
 
@@ -234,7 +234,7 @@ func TestGraphDisabledExtractsNothing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Repo: %v", err)
 	}
-	if len(result.Nodes) != 0 || len(result.Edges) != 0 {
+	if len(result.Nodes) != 0 {
 		t.Error("expected the kill switch to disable extraction entirely")
 	}
 }

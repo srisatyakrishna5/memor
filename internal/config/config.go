@@ -61,11 +61,9 @@ type CacheConfig struct {
 
 // RetrievalConfig tunes the single ranking pipeline.
 type RetrievalConfig struct {
-	MaxHops    int     `toml:"max_hops"`
 	MinScore   float64 `toml:"min_score"`
 	BM25       float64 `toml:"w_bm25"`
-	Proximity  float64 `toml:"w_proximity"`
-	Rank       float64 `toml:"w_rank"`
+	Changed    float64 `toml:"w_changed"`
 	Tag        float64 `toml:"w_tag"`
 	Recency    float64 `toml:"w_recency"`
 	MaxSymbols int     `toml:"max_symbols_per_file"`
@@ -117,11 +115,9 @@ func Default() Config {
 			},
 		},
 		Retrieval: RetrievalConfig{
-			MaxHops:    constants.DefaultMaxHops,
 			MinScore:   constants.DefaultMinScore,
 			BM25:       constants.ScoreBM25,
-			Proximity:  constants.ScoreProximity,
-			Rank:       constants.ScoreRank,
+			Changed:    constants.ScoreChanged,
 			Tag:        constants.ScoreTag,
 			Recency:    constants.ScoreRecency,
 			MaxSymbols: 8,
@@ -184,19 +180,15 @@ func (c Config) normalized() Config {
 	if c.Memory.TypeWeights == (TypeWeights{}) {
 		c.Memory.TypeWeights = d.Memory.TypeWeights
 	}
-	if c.Retrieval.MaxHops <= 0 {
-		c.Retrieval.MaxHops = d.Retrieval.MaxHops
-	}
 	if c.Retrieval.MinScore <= 0 {
 		c.Retrieval.MinScore = d.Retrieval.MinScore
 	}
 	if c.Retrieval.MaxSymbols <= 0 {
 		c.Retrieval.MaxSymbols = d.Retrieval.MaxSymbols
 	}
-	if c.Retrieval.BM25+c.Retrieval.Proximity+c.Retrieval.Rank+c.Retrieval.Tag+c.Retrieval.Recency <= 0 {
+	if c.Retrieval.BM25+c.Retrieval.Changed+c.Retrieval.Tag+c.Retrieval.Recency <= 0 {
 		c.Retrieval.BM25 = d.Retrieval.BM25
-		c.Retrieval.Proximity = d.Retrieval.Proximity
-		c.Retrieval.Rank = d.Retrieval.Rank
+		c.Retrieval.Changed = d.Retrieval.Changed
 		c.Retrieval.Tag = d.Retrieval.Tag
 		c.Retrieval.Recency = d.Retrieval.Recency
 	}

@@ -1,11 +1,14 @@
-// Package extract builds graph nodes and edges from a repository on disk.
+// Package extract builds graph nodes from a repository on disk.
 //
-// Extraction is deterministic and tiered. L0 recovers files, packages, and
-// imports with a line-oriented scan that needs no dependencies. L1 recovers
-// symbols, spans, and calls using the standard library's own parser. Neither
-// tier makes a network call, invokes a model, or requires CGO — which is what
-// keeps `memor build` a bounded local command and keeps the npm
+// Extraction is deterministic and tiered. L0 recovers files, packages, imports
+// and a one-line purpose with a line-oriented scan that needs no dependencies.
+// L1 recovers symbols, spans, and calls using the standard library's own
+// parser. Neither tier makes a network call, invokes a model, or requires CGO
+// — which is what keeps `memor build` a bounded local command and keeps the npm
 // cross-compilation matrix intact.
+//
+// Relations are written onto the nodes they belong to rather than emitted as
+// traversable edges, so retrieval can report them but never walk them.
 package extract
 
 import (
@@ -14,17 +17,15 @@ import (
 	"os"
 	"path"
 	"path/filepath"
-	"sort"
 	"strings"
 
 	"github.com/memor-dev/memor/internal/config"
 	"github.com/memor-dev/memor/internal/graph"
 )
 
-// Result is the full set of machine-derived nodes and edges for a repository.
+// Result is the full set of machine-derived nodes for a repository.
 type Result struct {
 	Nodes []*graph.Node
-	Edges []graph.Edge
 
 	FilesScanned int
 	FilesSkipped int
@@ -75,7 +76,6 @@ type builder struct {
 
 	byID       map[string]*graph.Node
 	order      []*graph.Node
-	edges      []graph.Edge
 	files      []*fileRecord
 	filesByRel map[string]*fileRecord
 	dirs       map[string]struct{}
@@ -93,26 +93,9 @@ func (b *builder) addNode(n *graph.Node) *graph.Node {
 	return n
 }
 
-func (b *builder) addEdge(from, to string, kind graph.EdgeKind, weight float32) {
-	if from == "" || to == "" || from == to {
-		return
-	}
-	b.edges = append(b.edges, graph.Edge{From: from, To: to, Kind: kind, W: weight})
-}
-
 func (b *builder) result() Result {
-	sort.Slice(b.edges, func(i, j int) bool {
-		if b.edges[i].From != b.edges[j].From {
-			return b.edges[i].From < b.edges[j].From
-		}
-		if b.edges[i].Kind != b.edges[j].Kind {
-			return b.edges[i].Kind < b.edges[j].Kind
-		}
-		return b.edges[i].To < b.edges[j].To
-	})
 	return Result{
 		Nodes:        b.order,
-		Edges:        b.edges,
 		FilesScanned: b.scanned,
 		FilesSkipped: b.skipped,
 	}
@@ -187,9 +170,9 @@ func (b *builder) indexFile(rel, abs string) {
 		dir = "(root)"
 	}
 	fileNode.SetMeta(graph.MetaPkg, dir)
+	fileNode.SetMeta(graph.MetaPurpose, Purpose(lang, data))
 
-	pkgNode := b.addNode(graph.PkgNode(dir))
-	b.addEdge(pkgNode.ID, fileNode.ID, graph.EdgeContains, 1)
+	b.addNode(graph.PkgNode(dir))
 	b.dirs[dir] = struct{}{}
 
 	rec := &fileRecord{
@@ -201,13 +184,15 @@ func (b *builder) indexFile(rel, abs string) {
 		imports: Imports(lang, data),
 	}
 
-	if b.cfg.Graph.Symbols && lang == "go" {
-		symbols, err := GoSymbols(rel, hash, data)
+	if b.cfg.Graph.Symbols && SupportsSymbols(lang) {
+		symbols, err := Symbols(lang, rel, hash, data)
 		if err == nil {
+			names := make([]string, 0, len(symbols))
 			for _, s := range symbols {
 				b.addNode(s.Node)
-				b.addEdge(fileNode.ID, s.Node.ID, graph.EdgeContains, 1)
+				names = append(names, s.Node.Name)
 			}
+			fileNode.SetMetaList(graph.MetaSymbols, names)
 			rec.symbols = symbols
 		}
 	}
@@ -216,34 +201,44 @@ func (b *builder) indexFile(rel, abs string) {
 	b.filesByRel[rel] = rec
 }
 
-// resolveImports turns raw import strings into edges. An import that resolves
-// inside the repository becomes a structural edge; anything else becomes an
-// external node, so a dependency is visible without pretending it has a body.
+// resolveImports records what each file imports and, in reverse, what imports
+// it. The reverse direction is the one an agent actually asks for — "what
+// breaks if I change this?" — so it is precomputed rather than derived.
 func (b *builder) resolveImports() {
+	dependents := make(map[string][]string)
+
 	for _, f := range b.files {
-		seen := make(map[string]struct{}, len(f.imports))
+		targets := make([]string, 0, len(f.imports))
 		for _, imp := range f.imports {
-			target, kind := b.resolveImport(f, imp)
+			target := b.resolveImport(f, imp)
 			if target == "" {
 				continue
 			}
-			if _, dup := seen[target]; dup {
-				continue
-			}
-			seen[target] = struct{}{}
+			targets = append(targets, target)
+			dependents[target] = append(dependents[target], f.rel)
+		}
+		if node, ok := b.byID[f.nodeID]; ok {
+			node.SetMetaList(graph.MetaImports, targets)
+		}
+	}
 
-			// A third-party package is worth showing but must not accumulate
-			// rank: it is imported by many files and depends on none of them.
-			weight := float32(1)
-			if node, ok := b.byID[target]; ok && node.Kind == graph.KindExt {
-				weight = 0.25
+	for target, importers := range dependents {
+		for _, id := range []string{
+			graph.NodeID(graph.KindFile, target),
+			graph.NodeID(graph.KindPkg, target),
+		} {
+			if node, ok := b.byID[id]; ok {
+				node.AppendMetaList(graph.MetaDependents, importers)
+				break
 			}
-			b.addEdge(f.nodeID, target, kind, weight)
 		}
 	}
 }
 
-func (b *builder) resolveImport(f *fileRecord, imp string) (string, graph.EdgeKind) {
+// resolveImport maps a raw import specifier onto what it refers to: a repo path,
+// a repo package directory, or the external specifier itself. An import that
+// cannot be placed returns "" rather than a guess.
+func (b *builder) resolveImport(f *fileRecord, imp string) string {
 	switch f.lang {
 	case "go":
 		if b.goModule != "" && strings.HasPrefix(imp, b.goModule) {
@@ -252,27 +247,27 @@ func (b *builder) resolveImport(f *fileRecord, imp string) (string, graph.EdgeKi
 				dir = "(root)"
 			}
 			if _, ok := b.dirs[dir]; ok {
-				return graph.NodeID(graph.KindPkg, dir), graph.EdgeImports
+				return dir
 			}
 		}
-		// The standard library is deliberately not modelled. Every Go file
-		// imports fmt or os, so including them would make those the highest
-		// PageRank nodes in the repository while carrying no signal about it.
+		// The standard library is deliberately not recorded. Every Go file
+		// imports fmt or os, so listing them would bury the handful of imports
+		// that actually say something about the file.
 		if isGoStdlib(imp) {
-			return "", graph.EdgeImports
+			return ""
 		}
 	case "js", "ts", "python", "rust":
-		if id := b.resolveRelative(f, imp); id != "" {
-			return id, graph.EdgeImports
+		if rel := b.resolveRelative(f, imp); rel != "" {
+			return rel
 		}
 	}
 
 	if isLocalSpecifier(imp) {
 		// A relative path that failed to resolve is a broken or generated
 		// import. Recording it as an external dependency would be a lie.
-		return "", graph.EdgeImports
+		return ""
 	}
-	return b.addNode(graph.ExtNode(imp)).ID, graph.EdgeImports
+	return imp
 }
 
 // isGoStdlib reports whether an import path is in the standard library. The
@@ -309,7 +304,7 @@ func (b *builder) resolveRelative(f *fileRecord, imp string) string {
 	}
 	for _, c := range candidates {
 		if rec, ok := b.filesByRel[c]; ok && rec.rel != f.rel {
-			return rec.nodeID
+			return rec.rel
 		}
 	}
 	return ""
@@ -343,45 +338,58 @@ func isLocalSpecifier(imp string) bool {
 
 // resolveCalls links call sites to symbol definitions, preferring a definition
 // in the same file and then in the same package. Unresolvable names are dropped
-// rather than guessed: a wrong edge is a distractor, and a distractor is worse
-// than a missing edge.
+// rather than guessed: a wrong relation is a distractor, and a distractor is
+// worse than a missing one. Targets are qualified as path#name so two
+// same-named symbols in different files stay distinguishable.
 func (b *builder) resolveCalls() {
-	byFile := make(map[string]map[string]string)
-	byDir := make(map[string]map[string]string)
+	byFile := make(map[string]map[string]*graph.Node)
+	byDir := make(map[string]map[string]*graph.Node)
 	for _, f := range b.files {
 		for _, s := range f.symbols {
 			if byFile[f.rel] == nil {
-				byFile[f.rel] = make(map[string]string)
+				byFile[f.rel] = make(map[string]*graph.Node)
 			}
 			if byDir[f.dir] == nil {
-				byDir[f.dir] = make(map[string]string)
+				byDir[f.dir] = make(map[string]*graph.Node)
 			}
-			byFile[f.rel][s.Node.Name] = s.Node.ID
+			byFile[f.rel][s.Node.Name] = s.Node
 			if _, exists := byDir[f.dir][s.Node.Name]; !exists {
-				byDir[f.dir][s.Node.Name] = s.Node.ID
+				byDir[f.dir][s.Node.Name] = s.Node
 			}
 		}
 	}
 
+	callers := make(map[string][]string)
 	for _, f := range b.files {
 		for _, s := range f.symbols {
-			seen := make(map[string]struct{}, len(s.Calls))
+			var calls []string
 			for _, name := range s.Calls {
 				target, ok := byFile[f.rel][name]
 				if !ok {
 					target, ok = byDir[f.dir][name]
 				}
-				if !ok || target == s.Node.ID {
+				if !ok || target.ID == s.Node.ID {
 					continue
 				}
-				if _, dup := seen[target]; dup {
-					continue
-				}
-				seen[target] = struct{}{}
-				b.addEdge(s.Node.ID, target, graph.EdgeCalls, 1)
+				calls = append(calls, QualifySymbol(target))
+				callers[target.ID] = append(callers[target.ID], QualifySymbol(s.Node))
 			}
+			s.Node.SetMetaList(graph.MetaCalls, calls)
 		}
 	}
+	for id, names := range callers {
+		if node, ok := b.byID[id]; ok {
+			node.SetMetaList(graph.MetaCallers, names)
+		}
+	}
+}
+
+// QualifySymbol renders a symbol node as path#name.
+func QualifySymbol(n *graph.Node) string {
+	if p := graph.SpanPath(n); p != "" {
+		return p + "#" + n.Name
+	}
+	return n.Name
 }
 
 func languageOf(rel string) string {

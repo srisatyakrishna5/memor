@@ -1,97 +1,147 @@
 ---
 title: Memor Concepts
-description: How the repository knowledge graph is built, stored, ranked, and served
+description: How repository state is indexed, tracked, ranked, and served
 ---
 
 # Memor Concepts
 
 How Memor works, end to end. Read [README.md](README.md) first for what it does;
 this document explains why it is built the way it is. The reasoning behind the
-v2 design, including the alternatives that were rejected, is in
-[ADR-0001](docs/adr/adr-0001-memor-v2-code-knowledge-graph.md).
+current design, including the alternatives that were rejected and why the earlier
+knowledge-graph model was abandoned, is in
+[ADR-0002](docs/adr/adr-0002-static-repo-state.md).
 
 ---
 
 ## What Memor Solves
 
-An AI coding assistant begins every session with no structural model of your
-repository. Answering *"where is authentication handled and what calls it?"*
-requires a search-read-search loop that pulls whole files into the context
-window. Three costs follow:
+An AI coding assistant begins every session knowing nothing about your
+repository — above all, not what has changed since it last worked in it. So it
+rebuilds that picture from scratch, in a search-read-search loop that pulls whole
+files into the context window. Three costs follow:
 
-1. **Direct token cost.** A 500-line source file is roughly 4,000 tokens. Ten
+1. **Repetition cost.** The dominant one. The same exploration repeats every
+   session because nothing is persisted between them, even when nothing changed.
+2. **Direct token cost.** A 500-line source file is roughly 4,000 tokens. Ten
    such reads consume 40,000 tokens before any reasoning begins.
-2. **Quality cost.** Token spend is not neutral. Accuracy degrades as inputs
+3. **Quality cost.** Token spend is not neutral. Accuracy degrades as inputs
    grow, and it degrades most when the relevant fact sits in the middle of a
    long context. A *plausible but wrong* result is worse than no result: a
    single topically-related distractor measurably reduces accuracy, and several
    compound the effect.
-3. **Repetition cost.** The same exploration repeats every session, because
-   nothing is persisted.
 
-Memor indexes the repository into one graph, persists what past conversations
-learned, and serves a task-ranked map inside a token budget.
+Memor keeps a static picture of the repository, tracks what moved since each
+agent last looked, persists what past conversations learned, and serves all of it
+cheapest-first inside a token budget.
 
 ---
 
 ## The Big Picture
 
-Everything is a **node**. Nodes are connected by typed **edges**.
+Three layers of state, served through one escalation ladder.
 
 ```
-                    ┌────────────┐
-                    │   topic    │◄──── tagged ──── any node
-                    └────────────┘
+  MANIFEST            what is here
+  │  files, packages, symbols, docs — with purposes and spans
+  │
+  LEDGER              what moved
+  │  indexed commit vs HEAD vs working tree, per-agent watermarks
+  │
+  JOURNAL             what you did
+     decisions, fixes, workflows, preferences — attached to code
 
-  ┌────────┐             ┌────────┐            ┌────────┐
-  │  pkg   │─ contains ─►│  file  │─ contains ─►│  sym   │
-  └────────┘             └────────┘             └────────┘
-                          │      ▲                │    ▲
-                    imports      └── imports ──┐  │    │
-                          ▼                    │  └ calls
-                    ┌────────┐            ┌────────┐
-                    │  ext   │            │  file  │
-                    └────────┘            └────────┘
-                                               ▲
-  ┌────────┐                                   │
-  │  mem   │──────────── explains ─────────────┘
-  └────────┘
+                         │
+                         ▼
+  repo_brief  →  repo_changes  →  repo_map  →  symbol_find  →  symbol_read
+   ~600 tok        ~800 tok        2500 tok       ~700 tok        span only
 ```
 
-v1 had three parallel subsystems — memories, knowledge, and code — each with its
-own storage, reader, and ranker. `Context()` therefore built **two independent
-BM25 indexes** and ran **two packing loops** against a single budget, which is
-what produced silent duplicate emission and silent drops. One node type collapses
-that seam, so a single index and a single packer make the defect inexpressible.
+An agent starts at the left and stops at the first step that answers the
+question. Reading whole files sits off the right-hand end as the fallback.
+
+Everything is stored as one **node** type. There is no traversal: relations are
+metadata on the node they describe, so a query returns what it matched and
+nothing adjacent to it.
 
 ### Node kinds
 
 | Kind | Holds |
 |---|---|
-| `file` | A source file: path, line count, content hash, summary |
-| `sym` | A function, method, type, or constant with its exact byte span |
+| `file` | A source file: path, line count, content hash, purpose, imports, dependents |
+| `sym` | A function, method, type, or constant with its exact byte span, callers and callees |
 | `pkg` | A directory or module |
-| `ext` | A third-party dependency with no body in this repository |
 | `doc` | A section of a markdown document |
 | `mem` | A recorded decision, fix, workflow, or preference |
-| `topic` | A tag, promoted to a first-class node |
 
-### Edge kinds
+### Relation metadata
 
-| Edge | From → To | Produced by |
-|---|---|---|
-| `imports` | file → file, pkg, or ext | L0 extraction |
-| `contains` | pkg → file, file → sym | L0 / L1 extraction |
-| `calls` | sym → sym | L1 extraction |
-| `refs` | sym → sym, non-call use | L1 extraction |
-| `tagged` | any → topic | Tags on memories and docs |
-| `supersedes` | node → node | An explicit replacement |
-| `explains` | mem → file or sym | Recording a fact against code |
+| Key | On | Holds | Produced by |
+|---|---|---|---|
+| `imports` | file | repo paths, package dirs, external specifiers | L0 extraction |
+| `dependents` | file, pkg | repo paths that import it | L0 extraction |
+| `symbols` | file | names defined in it | L1 extraction |
+| `calls` / `callers` | sym | `path#name` of each end | L1 extraction |
+| `tags` | any | topic tags | Memories and docs |
+| `explains` | mem | node IDs the memory concerns | Recording a fact against code |
+| `supersedes` | mem | node IDs it replaces | An explicit replacement |
+
+`dependents` answers *"what breaks if I change this?"* — the question agents
+actually ask — and is free to precompute at build time.
 
 `explains` is the capability no comparable repository-map tool has. Others supply
 structure. Memor can additionally bind *"a persistent index was rejected on
 purpose"* to the exact symbol where a future agent would otherwise add one, and
-it resurfaces there without anyone searching for it. It costs one edge.
+it resurfaces there without anyone searching for it. Because node IDs are derived
+from content rather than assigned, that binding survives a rebuild that deletes
+and recreates the file node.
+
+---
+
+## Knowing What Changed
+
+This is the layer that makes the rest worth having.
+
+`memor build` records the commit it indexed in `state.json`. Each agent gets a
+watermark in `marks.jsonl` — the last repository state it was shown. `repo_brief`
+compares the two and advances the watermark, so the next call reports only what
+happened after this one.
+
+| Situation | Answer comes from |
+|---|---|
+| git repo, agent has been here | `git diff` from the agent's watermark, plus the dirty tree |
+| git repo, first visit | `git diff` from the indexed commit, plus the dirty tree |
+| no git | Stored file hashes compared against disk |
+
+The hash fallback is less precise — it detects that a file differs from the
+*index*, not from what the agent last *saw* — but it is never unavailable.
+
+### Seen versus unseen
+
+A commit is not enough on its own. Uncommitted work is the normal state of a
+working tree, so the same forty dirty files appear in the change list every
+single visit, and an agent told about all of them again has learned nothing from
+the second visit onwards.
+
+So a watermark also records the **content hash of every path it showed**. On the
+next visit each change is classified:
+
+- **unseen** — new to this agent, listed with its status and purpose.
+- **seen** — already shown at this exact content, listed as a bare path.
+
+Unseen changes sort first, so a truncated list drops what the agent already knows
+rather than what is new to it. When nothing is unseen, the brief says so and
+tells the agent to reuse what it has. Editing a file makes it unseen again,
+because its hash no longer matches what was recorded.
+
+Seen paths are still listed rather than hidden: a new conversation is a new
+context window, and a bare path costs a few tokens where re-reading the file
+costs thousands. A watermark is capped at `MaxTrackedPaths`; beyond it paths
+fall out and are reported as new again, which over-reports rather than under-
+reports.
+
+git is invoked with an argument vector, never a shell string, and every revision
+is validated as a hex object name before use, because revisions reach Memor from
+MCP clients.
 
 ---
 
@@ -123,27 +173,29 @@ serving a stale entry is structurally impossible.
 ```
 .memor/
 ├── config.toml      # Configuration
-├── graph.log        # Append-only JSONL: nodes, edges, tombstones
+├── graph.log        # Append-only JSONL: nodes and tombstones
 ├── graph.snap       # Compacted canonical JSONL (lossless)
 ├── graph.db         # Rendered projection (write-only output)
-├── graph.idx        # DERIVED: postings and PageRank. Deletable
+├── state.json       # Commit and time of the last build
+├── marks.jsonl      # Per-agent watermarks, one line each
 ├── graph.archive    # Evicted nodes
 ├── blobs/           # LRU body cache, hash-keyed, size-capped
 └── .lock
 ```
 
-Four rules keep this honest:
+Three rules keep this honest:
 
 1. **`graph.log` is the only append target.** Every write in the system is a
-   node, an edge, or a tombstone record.
+   node record or a tombstone.
 2. **`graph.snap` is the only lossless artifact.** Everything else regenerates
-   from it.
-3. **`graph.idx` is disposable by definition.** Delete it and the next command
-   rebuilds it. The compact binary-ish format lives here and nowhere else, which
-   buys load speed without creating an opaque source of truth.
-4. **`graph.db` is write-only.** Nothing parses it back. This is why v2 has no
-   bespoke format parser to keep in sync with its writer — v1 needed one only
-   because `knowledge.db` was both a projection and an input.
+   from it — including the term index, which is rebuilt in memory on load and
+   never written to disk, so it cannot drift out of sync with the store.
+3. **`graph.db` is write-only.** Nothing parses it back, which is why Memor has
+   no bespoke format parser to keep in sync with its writer.
+
+`state.json` and `marks.jsonl` are rewritten atomically rather than appended:
+both hold one current value per subject, so an append log would only create work
+for a compaction pass.
 
 ---
 
@@ -152,13 +204,16 @@ Four rules keep this honest:
 Every write appends one JSONL record to `graph.log`:
 
 ```jsonl
-{"o":"n","n":{"i":"7271f9a926dd","k":"mem","n":"s","x":"Archive before replacing the snapshot","t":1772800000,"m":{"t":"s","org":"agent"}}}
-{"o":"e","g":{"f":"7271f9a926dd","t":"3b1c8e2a4f90","k":"explains","w":1}}
+{"o":"n","n":{"i":"7271f9a926dd","k":"mem","n":"s","x":"Archive before replacing the snapshot","t":1772800000,"m":{"t":"s","org":"agent","exp":"3b1c8e2a4f90"}}}
 ```
 
-`o` is the operation: `n` (node), `e` (edge), `-n` and `-e` (tombstones). Append
-is O(1), needs no coordination beyond a short-lived lock, and survives a crash
-because a partial line is simply skipped on read.
+`o` is the operation: `n` (node) or `-n` (tombstone). Append is O(1), needs no
+coordination beyond a short-lived lock, and survives a crash because a partial
+line is simply skipped on read.
+
+Multi-valued metadata such as `exp` (what a memory explains) or `imp` (imports)
+is newline-joined inside the JSON string. A newline cannot appear in a path,
+identifier or tag, and JSON escapes it, so every record stays on one line.
 
 A malformed line warns and is skipped. One bad record must never destroy the
 store.
@@ -175,10 +230,8 @@ A node's ID is `sha256(kind + "\0" + normalize(identity))[:12]`, where
 | `file` | Project-relative path |
 | `sym` | `path#name` — so two same-named symbols in different files stay distinct |
 | `pkg` | Directory |
-| `ext` | Import specifier |
 | `doc` | `source#section` |
 | `mem` | The memory text itself |
-| `topic` | The tag |
 
 Three properties follow:
 
@@ -203,23 +256,49 @@ bindings are mostly C.
 
 | Tier | Scope | Mechanism |
 |---|---|---|
-| **L0** | Files, packages, imports | Line-oriented scan across Go, JS/TS, Python, Java, C#, Rust, Ruby, PHP |
-| **L1** | Symbols, spans, signatures, calls | `go/ast` from the standard library |
+| **L0** | Files, packages, imports, purpose lines | Line-oriented scan across Go, JS/TS, Python, Java, C#, Rust, Ruby, PHP |
+| **L1** | Symbols, spans, signatures | `go/ast` for Go; declaration matching plus brace or indent bounding elsewhere |
+| **L1+** | Calls and callers | Go only |
 | **L2** | Summaries, patterns, decisions | Agent-authored, merged onto extracted nodes |
+
+Go gets a real parser because it ships with the toolchain. Every other language
+is recovered by matching declaration lines and then bounding the body by brace
+depth or indentation:
+
+| Language | Declarations recovered |
+|---|---|
+| TypeScript, JavaScript | `function`, `class`, `interface`, `type`, `enum`, and named `const`/`let`/`var` |
+| Python | `def` and `class`, top level and one level in |
+| Rust | `fn`, `struct`, `enum`, `trait`, `impl`, `type`, `const`, `static`, `macro_rules!` |
+| Ruby | `def`, `class`, `module` |
+| PHP | `function`, `class`, `interface`, `trait`, `enum` |
+| Java, Kotlin, C#, Swift | Type declarations only |
+
+The omissions are the point. Java and C# methods are `Type name(args)` with no
+keyword to anchor on, and every heuristic that matches them also matches calls,
+casts and field initializers. Destructuring bindings and nested closures are
+skipped because no caller can reference them by name. **Calls and callers are
+resolved for Go alone**: matching call sites by name without scope analysis
+produces relations that look authoritative and are frequently wrong.
+
+tree-sitter would do all of this properly and is not an option — its Go bindings
+are mostly C, and CGO would break the cross-compiled binaries the npm installer
+ships.
+
+A **purpose line** is one sentence describing what a file is for, lifted from its
+leading comment or docstring. It is deliberately shallow: a filename banner, a
+licence header or a build directive yields nothing, because a wrong summary is
+worse than none. An agent overrides it with `memor remember --summary`, and that
+value wins on every later build.
 
 `memor build` prunes every machine-derived node before re-extracting, so deleted
 files and renamed symbols cannot linger as ghosts. Agent-authored memories and
 summaries survive untouched: extraction knows structure but not intent, so it
 must never blank a summary a human or agent wrote.
 
-Two exclusions are deliberate:
-
-- **The Go standard library is not modelled.** Every Go file imports `fmt` or
-  `os`, so including them would make `fmt` the highest-PageRank node in the
-  repository while carrying no signal about it.
-- **External dependency edges are damped.** A third-party package is worth
-  showing but must not accumulate rank: it is imported by many files and depends
-  on none of them.
+One exclusion is deliberate: **the Go standard library is not recorded.** Every
+Go file imports `fmt` or `os`, so listing them would bury the handful of imports
+that actually say something about the file.
 
 ---
 
@@ -228,17 +307,19 @@ Two exclusions are deliberate:
 One pipeline, four stages:
 
 ```go
-seeds    := Seeds(query, tags, openFiles)   // BM25 plus exact name match
-frontier := Expand(seeds, maxHops)          // weighted graph walk
-scored   := Score(frontier, query)
-kept     := gate(scored, minScore)          // precision floor
-return pack(kept, budget)                   // position-aware
+candidates := Candidates(query, tags, openFiles)  // BM25 plus exact name match
+scored     := Score(candidates, query, changed)
+kept       := gate(scored, minScore)              // precision floor
+return pack(kept, budget)                         // position-aware
 ```
+
+There is no expansion stage. A node that the query did not match is never a
+candidate, so the result set cannot grow past what was asked for.
 
 ### Scoring
 
 ```
-score = 0.30·BM25 + 0.25·proximity + 0.20·PageRank + 0.15·tags + 0.10·recency
+score = 0.45·BM25 + 0.20·recently-changed + 0.20·tags + 0.15·recency
 ```
 
 The result is multiplied by a kind weight (files outrank symbols, symbols
@@ -251,17 +332,12 @@ tokenizer and the same conservative suffix stripper. Without it a
 natural-language query and a machine-shaped identifier never meet: "compaction"
 and `Compact` share no token, so the file implementing compaction would score
 zero against a question about it. A file node also inherits the names of the
-symbols it contains, so a query naming a function reaches the file that defines
+symbols it defines, so a query naming a function reaches the file that defines
 it rather than only the bare symbol.
 
-**Proximity** is a decayed walk outward from the seeds, weighted per edge kind.
-A file contains dozens of symbols and a topic tags dozens of nodes, so
-propagating those at full strength would flood the frontier with everything
-structurally adjacent to one good hit.
-
-**PageRank** is computed offline at build time over the edge graph. Structure
-earns a node relevance independently of the query, which is what stops a
-rarely-named but heavily depended-on file from being invisible.
+**Recently-changed** boosts files that moved since the caller last looked. A
+question asked during a piece of work is almost always about that work, and this
+is the one signal a static index cannot supply on its own.
 
 ### The precision floor
 
@@ -269,11 +345,8 @@ rarely-named but heavily depended-on file from being invisible.
 returned is short.
 
 Underfilling is correct. One distractor measurably degrades output and four
-compound it, so a short answer beats a padded one. Structural weight alone
-cannot clear the floor either: a node must be lexically matched or directly
-adjacent to something that was. Without that rule a heavily depended-on symbol
-has high PageRank in *every* query and gets returned for questions it has
-nothing to do with.
+compound it, so a short answer beats a padded one. A node matching neither the
+query text nor a requested tag is masked before scoring even begins.
 
 ### Position-aware packing
 
@@ -284,8 +357,7 @@ recency-favoured tail.
 
 Packing also suppresses redundancy. A memory rendered inline on the file it
 explains is never also emitted standalone, and a symbol listed inside a selected
-file block is never emitted on its own. This is the guard that makes the v1
-double-emission defect inexpressible.
+file block is never emitted on its own.
 
 ---
 
@@ -348,24 +420,31 @@ Every file node carries the content hash recorded when it was indexed.
 lines under a correct-looking line number is worse than refusing, because the
 agent has no way to detect it.
 
-When enough of the graph has drifted, `repo_map` and `graph_status` say so and
-name the fix. A stale graph is worse than no graph.
+When enough of the index has drifted, `repo_map` and `memor_status` say so and
+name the fix. A stale index is worse than no index.
 
 ---
 
 ## The Agent Surface
 
-Five MCP tools. Bloated tool sets and ambiguous tool selection are a leading
-agent failure mode, so capability is folded into existing tools rather than added
-alongside them.
+Seven MCP tools arranged as an **escalation ladder**, cheapest first. Bloated
+tool sets and ambiguous tool selection are a leading agent failure mode, so each
+tool answers a question the one above it could not.
 
-| Tool | Replaces |
-|---|---|
-| `repo_map` | Reading files to find out where anything is |
-| `symbol_find` | grep and workspace search |
-| `symbol_read` | Whole-file reads |
-| `remember` | Losing the decision when the conversation ends |
-| `graph_status` | Guessing whether the map is trustworthy |
+| Tool | Answers | Budget |
+|---|---|---|
+| `repo_brief` | Where am I, what moved, what was I doing? | ≤ 600 tok |
+| `repo_changes` | Which files exactly, and do they matter? | ≤ 800 tok |
+| `repo_map` | Show me code I have not seen | 2500 tok default |
+| `symbol_find` | Where is this one thing? | ≤ 700 tok |
+| `symbol_read` | Show me its body | span size |
+| `remember` | Record this for next time | ≤ 60 tok |
+| `memor_status` | Can I trust the index? | ≤ 250 tok |
+
+The server instructions state the ladder explicitly and name reading whole files
+as the **fallback**, not the default. `repo_brief` advances the caller's
+watermark as a side effect, because reading it is what makes it the agent's new
+baseline — requiring a second call to confirm would cost tokens to say nothing.
 
 Each description carries a **behavioural contract**, not an API summary. A
 description that tells the model what to do with the result changes its
@@ -377,6 +456,10 @@ are versioned with the binary. `memor init` therefore owns two files outside
 `.memor/` — `.vscode/mcp.json`, because an MCP server cannot discover itself, and
 a fenced three-line block in `AGENTS.md`, because Copilot cannot be told to read
 a file it does not already know about.
+
+The parsed store is cached across tool calls and invalidated when `state.json`
+or the log changes, so a session of tool calls parses the snapshot once rather
+than once per call.
 
 ---
 
@@ -406,7 +489,6 @@ enabled = true
 max_bytes = 262144         # 256 KB hard cap on the body cache
 
 [retrieval]
-max_hops = 2
 min_score = 0.12           # Precision floor
 max_symbols_per_file = 8
 ```
@@ -416,28 +498,21 @@ memories only, with no repository extraction.
 
 ---
 
-## Migrating From v1
+## Upgrading
 
-A v1 store is migrated automatically on the first v2 command; `memor migrate`
-makes it explicit. It is idempotent, because a second run finds no v1 files.
+Memor is pre-1.0 and the on-disk format changes without a migration path. The
+earlier knowledge-graph format is not read by the current binary.
 
-| v1 | v2 |
-|---|---|
-| `Entry{Type: s/e/p/f}` | `Node{Kind: mem}` with the subtype in metadata |
-| `Entry.Tags` | `tagged` edges to `topic` nodes |
-| `Entry.Supersedes` | A `supersedes` edge, with IDs remapped |
-| `CodeMeta.FilePath`, `LOC`, `Hash` | `Node{Kind: file}` plus a span |
-| `CodeMeta.Exports` | `contains` edges to `sym` nodes |
-| `CodeMeta.Deps` | `imports` edges |
-| `CodeMeta.Summary` | `Node.Text` |
-| `KnowledgeSection` | `Node{Kind: doc}` |
+```bash
+memor export -o memories.jsonl   # with the old binary
+memor clean --all
+memor init --build               # with the new binary
+memor import memories.jsonl
+```
 
-v1 `Deps` were persisted but never traversed. Migration is where they become
-load-bearing, so an existing user gets a partial graph immediately — before any
-extraction runs.
-
-The v1 files are renamed to `*.v1.bak` rather than deleted. A migration that
-destroys the only copy of the data is not a migration.
+Only agent-authored nodes are worth carrying. Structural nodes are reproduced
+from source by `memor build` in well under a second, so exporting them would be
+exporting a derived artifact.
 
 ---
 
@@ -445,9 +520,11 @@ destroys the only copy of the data is not a migration.
 
 - All data stays local. No cloud, no telemetry, no network calls.
 - `.memor/` is gitignored by `memor init`.
-- Bodies are never copied into `.memor/`. The graph stores coordinates into
+- Bodies are never copied into `.memor/`. The store holds coordinates into
   files git already tracks.
 - The blob cache is keyed by content hash and capped in size.
+- git is invoked with an argument vector, never a shell string, and revisions
+  are validated as hex object names before use.
 - Never store secrets, API keys, passwords, or PII in memories.
 
 ---
@@ -456,19 +533,24 @@ destroys the only copy of the data is not a migration.
 
 | Not included | Why |
 |---|---|
-| Embeddings and vector search | Requires a model over the network or bundled; similarity returns code that *resembles* the query, which is exactly the distractor class that hurts most. "Calls", "imports", and "defined-in" are the relations an agent needs, and similarity does not encode them |
-| A graph database or query language | Requires a persistent server and a large prompt surface for the agent to learn. Progressive disclosure is achieved with one narrow expansion tool instead |
+| Graph traversal and PageRank | Tried and removed. Expansion returned the neighbourhood of a match, which is the distractor class that hurts most, and structural rank made heavily-imported files surface for questions they had nothing to do with. See [ADR-0002](docs/adr/adr-0002-static-repo-state.md) |
+| Embeddings and vector search | Requires a model over the network or bundled; similarity returns code that *resembles* the query, which is again the distractor problem |
+| A graph database or query language | Requires a persistent server and a large prompt surface for the agent to learn |
 | LLM-based extraction | Costs a model call per text unit, scaling with repository size, and makes indexing non-deterministic |
 | A daemon or background worker | Each command performs one bounded operation and exits |
 | Mirroring source into `.memor/` | Duplicates `.git/objects`, and two sources of truth make staleness undetectable without hashing on every read |
-| Committing the graph | Deferred, not rejected. It needs a merge driver and `.gitattributes` work that is not on the critical path |
+| Java/C# method extraction | `Type name(args)` has no keyword to anchor on, and every heuristic for it also matches calls, casts and field initializers |
+| Call graphs outside Go | Name matching without scope analysis produces relations that look authoritative and are often wrong |
+| Committing the store | Deferred, not rejected. It needs a merge driver and `.gitattributes` work that is not on the critical path |
 
 ---
 
 ## Where To Go Next
 
 - [README.md](README.md) — installation, commands, and quick start
-- [ADR-0001](docs/adr/adr-0001-memor-v2-code-knowledge-graph.md) — the full design rationale, evidence, and rejected alternatives
+- [ADR-0002](docs/adr/adr-0002-static-repo-state.md) — why the knowledge graph was replaced, and what was considered instead
+- [ADR-0001](docs/adr/adr-0001-memor-v2-code-knowledge-graph.md) — superseded, kept for the evidence base and the storage rules that still hold
 - `memor rules` — the protocol Memor expects an agent to follow
-- `internal/graph/` — nodes, edges, log, snapshot, index, projection
+- `internal/graph/` — nodes, log, snapshot, index, projection
+- `internal/vcs/` — the git reads behind the change ledger
 - `internal/retrieve/` — the single ranking and packing pipeline

@@ -22,12 +22,10 @@ const (
 // question lands on the file before it fans out to every function in it.
 // Documents sit below both: prose describes intent, code answers "where".
 const (
-	WeightFile  = 0.85
-	WeightSym   = 0.7
-	WeightDoc   = 0.6
-	WeightPkg   = 0.5
-	WeightExt   = 0.3
-	WeightTopic = 0.2
+	WeightFile = 0.85
+	WeightSym  = 0.7
+	WeightDoc  = 0.6
+	WeightPkg  = 0.5
 )
 
 // Time decay applied to memory nodes.
@@ -38,11 +36,10 @@ const (
 
 // Retrieval scoring weights. They sum to 1.0.
 const (
-	ScoreBM25      = 0.30
-	ScoreProximity = 0.25
-	ScoreRank      = 0.20
-	ScoreTag       = 0.15
-	ScoreRecency   = 0.10
+	ScoreBM25    = 0.45
+	ScoreChanged = 0.20
+	ScoreTag     = 0.20
+	ScoreRecency = 0.15
 )
 
 // Retrieval shape.
@@ -51,15 +48,14 @@ const (
 	// a plausible-but-wrong node: a single distractor measurably degrades model
 	// output, and four compound it.
 	DefaultMinScore = 0.12
-	DefaultMaxHops  = 2
-	// ProximityDecay discounts each additional hop away from a seed node.
-	ProximityDecay = 0.55
 )
 
-// PageRank parameters, computed offline at build time.
+// Token budgets. The brief is what an agent reads first in every session, so it
+// is capped hard enough that reading it is never the expensive choice.
 const (
-	PageRankDamping    = 0.85
-	PageRankIterations = 20
+	DefaultBriefBudget   = 600
+	DefaultChangesBudget = 800
+	DefaultMapBudget     = 2500
 )
 
 // Content hashing.

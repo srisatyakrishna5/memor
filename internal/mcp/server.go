@@ -1,6 +1,6 @@
-// Package mcp serves memor's knowledge graph over the Model Context Protocol.
+// Package mcp serves memor's repository state over the Model Context Protocol.
 //
-// Exposing the graph as tools rather than CLI invocations removes the
+// Exposing that state as tools rather than CLI invocations removes the
 // dependency on an agent voluntarily following prose rules in a markdown file:
 // hosts surface tools to the model directly, with typed arguments and validated
 // schemas, and the descriptions ship with the binary rather than living in a
@@ -14,8 +14,11 @@ import (
 	"context"
 	"errors"
 	"io"
+	"sync"
 
+	"github.com/memor-dev/memor/internal/graph"
 	"github.com/memor-dev/memor/internal/session"
+	"github.com/memor-dev/memor/internal/store"
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -28,33 +31,58 @@ const codeServerClosing = -32004
 // Instructions is injected into the model's system prompt by MCP hosts. It
 // carries the workflow a repository AGENTS.md previously had to spell out, and
 // `memor rules` prints the same text so the CLI and the tools never disagree.
-const Instructions = `Memor holds a persistent map of this repository plus everything learned about it in past conversations.
+const Instructions = `Memor remembers this repository for you: what is in it, what changed since you
+last looked, and what you decided in previous conversations. Its purpose is to
+let you plan a task without loading the codebase into context.
 
-Call repo_map once at the start of a conversation, before reading or searching
-any file. Pass the user's request as the query. The result gives you the files
-that matter, their signatures with exact line ranges, what depends on what, and
-the decisions behind them.
+Work down this ladder. Stop at the first step that answers the question.
 
-Use symbol_find instead of grep to locate a function, method, or type. Use
-symbol_read instead of reading a whole file: it returns the exact lines a symbol
-occupies, not the four hundred lines around it.
+1. repo_brief  - call this FIRST in every conversation, before anything else.
+                 It costs a few hundred tokens and tells you what this project
+                 is, what moved since your last session, and what you left
+                 unfinished.
+2. repo_changes- what changed, in detail. Use it when the brief says files moved
+                 and you need to know which ones matter.
+3. repo_map    - a task-scoped view. Pass the user's request verbatim as the
+                 query. Use it when you need code you have not seen yet.
+4. symbol_find - locate one function, method, or type. Use this instead of grep.
+5. symbol_read - read the exact lines a symbol occupies. Use this instead of
+                 reading a whole file.
+
+Reading whole files is the fallback, not the default. If the tools above did not
+answer the question, read the specific file they pointed you at - not its
+neighbours.
 
 Call remember at the end of a turn whenever a decision was made, a bug was
 diagnosed, a workflow was established, or the user stated a preference. Record
 why something was chosen and what was rejected, not just what changed. Attach it
-to the files or symbols it explains so the next conversation finds it in place.
+to the files or symbols it explains. Set task and status to leave yourself a
+note about unfinished work; repo_brief will hand it back next session.
 
-If repo_map reports the graph is stale or empty, run 'memor build' in a terminal.
+If a tool reports the index is stale or empty, run 'memor build' in a terminal.
 
 Never edit files under .memor/ directly. Use these tools.`
 
-// Server adapts the memor graph to MCP.
+// Server adapts memor's repository state to MCP.
 type Server struct {
 	// start is the directory the server was launched from. The project root is
 	// resolved from it on every call so the server survives a `memor init` that
 	// happens after startup.
 	start   string
 	version string
+
+	mu       sync.Mutex
+	cached   *loaded
+	stateAt  int64
+	logBytes int64
+}
+
+// loaded is a parsed store held across tool calls. Rebuilding the term index on
+// every call was the dominant per-call cost, and it is pure derived data.
+type loaded struct {
+	sess *session.Session
+	g    *graph.Graph
+	ix   *graph.Index
 }
 
 // NewServer returns a Server rooted at the given directory.
@@ -96,8 +124,8 @@ func (s *Server) sdkServer() *sdk.Server {
 	srv := sdk.NewServer(
 		&sdk.Implementation{
 			Name:        "memor",
-			Title:       "Memor Repository Graph",
-			Description: "Token-budgeted repository map and persistent project memory for AI coding assistants.",
+			Title:       "Memor Repository Memory",
+			Description: "Token-budgeted repository state and persistent project memory for AI coding assistants.",
 			Version:     s.version,
 		},
 		&sdk.ServerOptions{Instructions: Instructions},
@@ -106,13 +134,46 @@ func (s *Server) sdkServer() *sdk.Server {
 	return srv
 }
 
-// session resolves the project root, config, and graph for a single tool call.
+// session resolves the project root and config for a single tool call.
 func (s *Server) session() (*session.Session, error) {
-	sess, err := session.Open(s.start)
+	return session.Open(s.start)
+}
+
+// load returns the parsed store, reusing the previous parse when nothing has
+// been written since. Freshness is decided by state.json's timestamp and the
+// log's size, both of which change on any write, so a stale reuse is not
+// possible without an external process bypassing the store API.
+func (s *Server) load() (*session.Session, *graph.Graph, *graph.Index, error) {
+	sess, err := s.session()
 	if err != nil {
-		return nil, err
+		return nil, nil, nil, err
 	}
-	return sess, nil
+
+	stateAt := store.StateModTime(sess.Paths.State)
+	logBytes := store.FileSize(sess.Paths.Log)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.cached != nil && s.cached.sess.Root == sess.Root &&
+		s.stateAt == stateAt && s.logBytes == logBytes {
+		return s.cached.sess, s.cached.g, s.cached.ix, nil
+	}
+
+	g, ix, err := sess.Graph()
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	s.cached = &loaded{sess: sess, g: g, ix: ix}
+	s.stateAt, s.logBytes = stateAt, logBytes
+	return sess, g, ix, nil
+}
+
+// invalidate drops the cached parse after a write.
+func (s *Server) invalidate() {
+	s.mu.Lock()
+	s.cached = nil
+	s.mu.Unlock()
 }
 
 func textResult(s string) *sdk.CallToolResult {

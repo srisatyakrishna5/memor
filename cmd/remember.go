@@ -1,7 +1,7 @@
 // remember.go — memor remember
 //
 // Records a fact and optionally binds it to the files and symbols it explains.
-// An explains edge is what makes a decision surface on the exact node where a
+// The attachment is what makes a decision surface on the exact node where a
 // future agent would otherwise repeat the mistake.
 //
 // Flags:

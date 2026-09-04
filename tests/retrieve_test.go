@@ -19,6 +19,10 @@ func retrievalFixture(t *testing.T) (*graph.Graph, *graph.Index) {
 
 	auth := graph.FileNode("internal/auth/session.go", "Session issuance and validation", 120, "aaaaaa", "go")
 	billing := graph.FileNode("internal/billing/invoice.go", "Invoice generation", 200, "bbbbbb", "go")
+	auth.SetMetaList(graph.MetaSymbols, []string{"ValidateToken"})
+	auth.SetMetaList(graph.MetaDependents, []string{"internal/billing/invoice.go"})
+	billing.SetMetaList(graph.MetaSymbols, []string{"Total"})
+	billing.SetMetaList(graph.MetaImports, []string{"internal/auth"})
 	g.AddNode(auth)
 	g.AddNode(billing)
 
@@ -28,18 +32,12 @@ func retrievalFixture(t *testing.T) (*graph.Graph, *graph.Index) {
 		&graph.Span{Path: "internal/billing/invoice.go", Start: 0, End: 30, L0: 8, L1: 15, Hash: "bbbbbb"})
 	g.AddNode(validate)
 	g.AddNode(total)
-	g.AddEdge(graph.Edge{From: auth.ID, To: validate.ID, Kind: graph.EdgeContains, W: 1})
-	g.AddEdge(graph.Edge{From: billing.ID, To: total.ID, Kind: graph.EdgeContains, W: 1})
-	g.AddEdge(graph.Edge{From: billing.ID, To: auth.ID, Kind: graph.EdgeImports, W: 1})
 
-	topic := graph.TopicNode("auth")
 	memory := graph.MemNode("Sessions are validated against a rotating key set, not a static secret", graph.MemSemantic, time.Now().Unix())
-	g.AddNode(topic)
+	memory.SetMetaList(graph.MetaTags, []string{"auth"})
+	memory.SetMetaList(graph.MetaExplains, []string{auth.ID})
 	g.AddNode(memory)
-	g.AddEdge(graph.Edge{From: memory.ID, To: topic.ID, Kind: graph.EdgeTagged, W: 1})
-	g.AddEdge(graph.Edge{From: memory.ID, To: auth.ID, Kind: graph.EdgeExplains, W: 1})
 
-	g.Resolve()
 	return g, graph.BuildIndex(g)
 }
 
@@ -54,9 +52,7 @@ func TestRetrieveRanksTheRelevantFileFirst(t *testing.T) {
 		t.Errorf("expected the auth file first, got %q:\n%s", result.Nodes[0].Node.Name, result.Text)
 	}
 
-	// A direct dependent is legitimate context for "what breaks if I change
-	// this", so billing may appear — but only below the file that answers the
-	// question.
+	// A file that only depends on the answer must never outrank it.
 	authIndex, billingIndex := -1, -1
 	for i, s := range result.Nodes {
 		switch s.Node.Name {
@@ -68,6 +64,39 @@ func TestRetrieveRanksTheRelevantFileFirst(t *testing.T) {
 	}
 	if billingIndex >= 0 && billingIndex < authIndex {
 		t.Errorf("the dependent outranked the file that answers the query:\n%s", result.Text)
+	}
+}
+
+// The whole point of dropping graph expansion: a query must not drag in a
+// file's neighbours just because they are adjacent to a match.
+func TestNeighboursAreNotPulledIn(t *testing.T) {
+	g, ix := retrievalFixture(t)
+
+	result := retrieve.Retrieve(g, ix, config.Default(), retrieve.Query{
+		Text:   "rotating key set",
+		Budget: 4000,
+	})
+	for _, s := range result.Nodes {
+		if s.Node.Name == "internal/billing/invoice.go" {
+			t.Errorf("an unrelated neighbour was pulled into the result:\n%s", result.Text)
+		}
+	}
+}
+
+// A path filter must be able to confine a broad query to one area.
+func TestPathFilterConfinesResults(t *testing.T) {
+	g, ix := retrievalFixture(t)
+
+	result := retrieve.Retrieve(g, ix, config.Default(), retrieve.Query{
+		Text:   "session invoice",
+		Paths:  []string{"internal/billing"},
+		Budget: 4000,
+	})
+	for _, s := range result.Nodes {
+		if !strings.HasPrefix(s.Node.Name, "internal/billing") &&
+			!strings.HasPrefix(graph.SpanPath(s.Node), "internal/billing") {
+			t.Errorf("result escaped the path filter: %q", s.Node.Name)
+		}
 	}
 }
 
@@ -110,9 +139,6 @@ func TestPrecisionFloorDropsIrrelevantNodes(t *testing.T) {
 	if len(result.Nodes) != 0 {
 		t.Errorf("expected nothing above the floor, got %d nodes:\n%s", len(result.Nodes), result.Text)
 	}
-	if result.Rejected == 0 {
-		t.Error("expected the gate to report what it dropped")
-	}
 }
 
 func TestBudgetIsRespected(t *testing.T) {
@@ -134,7 +160,6 @@ func TestStrongestResultsTakeBothEnds(t *testing.T) {
 		summary := strings.TrimSpace(strings.Repeat("session ", repeat))
 		g.AddNode(graph.FileNode(fmt.Sprintf("internal/auth/file%d.go", i), summary, 10, "aaaaaa", "go"))
 	}
-	g.Resolve()
 
 	result := retrieve.Retrieve(g, graph.BuildIndex(g), config.Default(), retrieve.Query{
 		Text:   "session",

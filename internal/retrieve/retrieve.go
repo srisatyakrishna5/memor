@@ -1,9 +1,8 @@
 // Package retrieve implements memor's one ranking and packing pipeline.
 //
-// v1 built two independent BM25 indexes and ran two packing loops against a
-// single budget, which is what produced silent duplicate emission and silent
-// drops. There is exactly one index and one packer here, so that class of
-// defect is not expressible.
+// It scores only what the query actually matched. There is no graph walk, so a
+// result set can never grow past the nodes a query names — which is the whole
+// point: an agent asking about one thing must not be handed its neighbourhood.
 package retrieve
 
 import (
@@ -22,8 +21,9 @@ type Query struct {
 	Text      string
 	Tags      []string
 	OpenFiles []string
+	Paths     []string // restrict results to these path prefixes
+	Changed   []string // paths changed since the caller last looked
 	Budget    int
-	MaxHops   int
 	MinScore  float64
 	Limit     int
 	Kinds     []graph.Kind
@@ -44,15 +44,14 @@ type Result struct {
 	Rejected int
 }
 
-const maxSeeds = 16
+const maxSeeds = 24
 
-// Retrieve ranks the graph for a query and packs the survivors into a budget.
+// Retrieve ranks the store for a query and packs the survivors into a budget.
 func Retrieve(g *graph.Graph, ix *graph.Index, cfg config.Config, q Query) Result {
 	q = q.withDefaults(cfg)
 
-	seeds := seedNodes(g, ix, q)
-	frontier := expand(g, seeds, q.MaxHops)
-	scored, masked := score(g, ix, cfg, q, frontier)
+	candidates := candidateNodes(g, ix, q)
+	scored, masked := score(g, ix, cfg, q, candidates)
 	kept, gated := gate(scored, q)
 	packed, text, tokens := pack(g, cfg, kept, q.Budget)
 
@@ -70,141 +69,75 @@ func (q Query) withDefaults(cfg config.Config) Query {
 	if q.Budget <= 0 {
 		q.Budget = cfg.Memory.TokenBudget
 	}
-	if q.MaxHops <= 0 {
-		q.MaxHops = cfg.Retrieval.MaxHops
-	}
 	if q.MinScore <= 0 {
 		q.MinScore = cfg.Retrieval.MinScore
 	}
 	return q
 }
 
-// seedNodes anchors the walk. Seeds are the nodes a query names directly, the
-// files the caller already has open, and the topics it tagged.
-func seedNodes(g *graph.Graph, ix *graph.Index, q Query) map[string]float64 {
-	seeds := make(map[string]float64)
+// candidateNodes collects everything eligible to be scored: nodes the query
+// names directly, the files the caller already has open, and anything carrying
+// a requested tag. An empty query falls back to the whole store, because with
+// nothing to match against there is nothing to be off-topic about.
+func candidateNodes(g *graph.Graph, ix *graph.Index, q Query) []string {
+	set := make(map[string]struct{})
 
 	for _, id := range ix.Seeds(q.Text, maxSeeds) {
-		seeds[id] = 1
+		set[id] = struct{}{}
 	}
 	for _, path := range q.OpenFiles {
 		if n, ok := g.FindFile(strings.TrimSpace(path)); ok {
-			seeds[n.ID] = 1
+			set[n.ID] = struct{}{}
 		}
 	}
-	for _, id := range g.TopicIDs(q.Tags) {
-		seeds[id] = 1
+	for _, id := range g.NodesTagged(q.Tags) {
+		set[id] = struct{}{}
 	}
 	// An exact symbol name in the query is a much stronger signal than any BM25
 	// score it happens to produce.
 	for _, word := range strings.Fields(q.Text) {
 		for _, n := range g.FindSymbols(strings.Trim(word, "()[]{}.,;:\"'`")) {
 			if strings.EqualFold(n.Name, word) {
-				seeds[n.ID] = 1
+				set[n.ID] = struct{}{}
 			}
 		}
 	}
-	return seeds
-}
 
-// expand walks outward from the seeds, discounting each hop. Proximity is what
-// lets "where is auth handled" reach the file that only the handler imports.
-//
-// Decay is edge-kind aware. A file contains dozens of symbols and a topic tags
-// dozens of nodes, so propagating those at full strength would flood the
-// frontier with everything structurally adjacent to one good hit.
-func expand(g *graph.Graph, seeds map[string]float64, maxHops int) map[string]float64 {
-	frontier := make(map[string]float64, len(seeds)*4)
-	for id, w := range seeds {
-		frontier[id] = w
-	}
-
-	current := make([]string, 0, len(seeds))
-	for id := range seeds {
-		current = append(current, id)
-	}
-	sort.Strings(current)
-
-	weight := 1.0
-	for hop := 0; hop < maxHops && len(current) > 0; hop++ {
-		weight *= constants.ProximityDecay
-		var next []string
-		for _, id := range current {
-			for neighbor, kind := range neighbors(g, id) {
-				candidate := weight * edgeDecay(kind)
-				if existing, seen := frontier[neighbor]; seen && existing >= candidate {
-					continue
-				}
-				frontier[neighbor] = candidate
-				next = append(next, neighbor)
-			}
-		}
-		sort.Strings(next)
-		current = next
-	}
-
-	// With no seeds there is nothing to walk from, so rank the whole graph and
-	// let structural weight decide.
-	if len(seeds) == 0 {
+	if len(set) == 0 && q.Text == "" && len(q.Tags) == 0 {
 		for _, n := range g.Nodes() {
-			frontier[n.ID] = 0
+			set[n.ID] = struct{}{}
 		}
 	}
-	return frontier
-}
 
-// neighbors returns adjacent node IDs with the strongest edge kind connecting
-// them, in either direction.
-func neighbors(g *graph.Graph, id string) map[string]graph.EdgeKind {
-	out := make(map[string]graph.EdgeKind)
-	record := func(other string, kind graph.EdgeKind) {
-		if existing, ok := out[other]; ok && edgeDecay(existing) >= edgeDecay(kind) {
-			return
-		}
-		out[other] = kind
+	out := make([]string, 0, len(set))
+	for id := range set {
+		out = append(out, id)
 	}
-	for _, e := range g.Out(id) {
-		record(e.To, e.Kind)
-	}
-	for _, e := range g.In(id) {
-		record(e.From, e.Kind)
-	}
+	sort.Strings(out)
 	return out
-}
-
-func edgeDecay(kind graph.EdgeKind) float64 {
-	switch kind {
-	case graph.EdgeImports, graph.EdgeCalls, graph.EdgeExplains:
-		return 1.0
-	case graph.EdgeRefs:
-		return 0.8
-	case graph.EdgeContains:
-		return 0.5
-	case graph.EdgeTagged:
-		return 0.4
-	default:
-		return 0.3
-	}
 }
 
 // score blends the ranking signals and reports how many candidates it masked
 // out for having no query relevance at all.
-func score(g *graph.Graph, ix *graph.Index, cfg config.Config, q Query, frontier map[string]float64) ([]Scored, int) {
+func score(g *graph.Graph, ix *graph.Index, cfg config.Config, q Query, candidates []string) ([]Scored, int) {
 	maxBM25 := ix.MaxBM25(q.Text)
-	maxRank := ix.MaxRank()
 
 	tagSet := make(map[string]struct{}, len(q.Tags))
 	for _, t := range q.Tags {
-		tagSet[strings.ToLower(strings.TrimSpace(strings.TrimPrefix(t, "#")))] = struct{}{}
+		tagSet[graph.NormalizeTag(t)] = struct{}{}
 	}
 	kindFilter := make(map[graph.Kind]struct{}, len(q.Kinds))
 	for _, k := range q.Kinds {
 		kindFilter[k] = struct{}{}
 	}
+	changedSet := make(map[string]struct{}, len(q.Changed))
+	for _, p := range q.Changed {
+		changedSet[strings.TrimSpace(p)] = struct{}{}
+	}
 
-	out := make([]Scored, 0, len(frontier))
+	out := make([]Scored, 0, len(candidates))
 	masked := 0
-	for id, proximity := range frontier {
+	for _, id := range candidates {
 		n, ok := g.Node(id)
 		if !ok || n.IsExpired() {
 			continue
@@ -214,9 +147,7 @@ func score(g *graph.Graph, ix *graph.Index, cfg config.Config, q Query, frontier
 				continue
 			}
 		}
-		// Topics are navigation aids, not answers. They steer the walk and then
-		// stay out of the result.
-		if n.Kind == graph.KindTopic {
+		if !withinPaths(n, q.Paths) {
 			continue
 		}
 
@@ -225,23 +156,9 @@ func score(g *graph.Graph, ix *graph.Index, cfg config.Config, q Query, frontier
 			bm25 = ix.BM25(id, q.Text) / maxBM25
 		}
 
-		// Structural weight alone must not clear the floor. A heavily depended-on
-		// symbol has high PageRank in every query, so without this it is returned
-		// for questions it has nothing to do with — the topically-adjacent
-		// distractor that costs more accuracy than an outright omission.
-		if q.Text != "" && bm25 == 0 && proximity < constants.ProximityDecay {
-			masked++
-			continue
-		}
-
-		rank := 0.0
-		if maxRank > 0 {
-			rank = ix.Rank[id] / maxRank
-		}
-
 		tagBoost := 0.0
 		if len(tagSet) > 0 {
-			for _, tag := range g.Tags(id) {
+			for _, tag := range n.Tags() {
 				if _, ok := tagSet[tag]; ok {
 					tagBoost = 1
 					break
@@ -249,9 +166,20 @@ func score(g *graph.Graph, ix *graph.Index, cfg config.Config, q Query, frontier
 			}
 		}
 
+		// A node that matched nothing about the query is a distractor, and a
+		// distractor costs more accuracy than an outright omission.
+		if q.Text != "" && bm25 == 0 && tagBoost == 0 {
+			masked++
+			continue
+		}
+
+		changed := 0.0
+		if _, ok := changedSet[nodePath(n)]; ok {
+			changed = 1
+		}
+
 		blended := cfg.Retrieval.BM25*bm25 +
-			cfg.Retrieval.Proximity*proximity +
-			cfg.Retrieval.Rank*rank +
+			cfg.Retrieval.Changed*changed +
 			cfg.Retrieval.Tag*tagBoost +
 			cfg.Retrieval.Recency*recency(n, cfg)
 
@@ -265,6 +193,26 @@ func score(g *graph.Graph, ix *graph.Index, cfg config.Config, q Query, frontier
 		return out[i].Node.ID < out[j].Node.ID
 	})
 	return out, masked
+}
+
+func nodePath(n *graph.Node) string {
+	if p := graph.SpanPath(n); p != "" {
+		return p
+	}
+	return n.Name
+}
+
+func withinPaths(n *graph.Node, prefixes []string) bool {
+	if len(prefixes) == 0 {
+		return true
+	}
+	path := nodePath(n)
+	for _, prefix := range prefixes {
+		if prefix = strings.TrimSpace(prefix); prefix != "" && strings.HasPrefix(path, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func recency(n *graph.Node, cfg config.Config) float64 {
@@ -287,12 +235,10 @@ func kindWeight(n *graph.Node, cfg config.Config) float64 {
 		return constants.WeightDoc
 	case graph.KindPkg:
 		return constants.WeightPkg
-	case graph.KindExt:
-		return constants.WeightExt
 	case graph.KindMem:
 		return cfg.TypeWeight(n.MemType())
 	default:
-		return constants.WeightTopic
+		return constants.WeightPkg
 	}
 }
 
@@ -363,7 +309,7 @@ const maxSectionsPerDoc = 2
 // end of a context window, so the strongest results take both ends and the
 // weakest survivors sit in the middle where they cost least.
 func pack(g *graph.Graph, cfg config.Config, scored []Scored, budget int) ([]Scored, string, int) {
-	header := fmt.Sprintf("@g v2 | %d files | %d symbols | %d memories | budget:%d\n",
+	header := fmt.Sprintf("@g v3 | %d files | %d symbols | %d memories | budget:%d\n",
 		g.CountByKind()[graph.KindFile.String()],
 		g.CountByKind()[graph.KindSym.String()],
 		g.CountByKind()[graph.KindMem.String()],
@@ -434,16 +380,13 @@ func redundant(g *graph.Graph, n *graph.Node, candidateFiles map[string]struct{}
 		_, ok := candidateFiles[graph.NodeID(graph.KindFile, n.Span.Path)]
 		return ok
 	case graph.KindMem:
-		for _, e := range g.Out(n.ID) {
-			if e.Kind != graph.EdgeExplains {
-				continue
-			}
-			if _, ok := candidateFiles[e.To]; ok {
+		for _, target := range n.MetaList(graph.MetaExplains) {
+			if _, ok := candidateFiles[target]; ok {
 				return true
 			}
 			// A memory bound to a symbol renders inline on that symbol's file.
-			if target, found := g.Node(e.To); found && target.Kind == graph.KindSym && target.Span != nil {
-				if _, ok := candidateFiles[graph.NodeID(graph.KindFile, target.Span.Path)]; ok {
+			if node, found := g.Node(target); found && node.Kind == graph.KindSym {
+				if _, ok := candidateFiles[graph.NodeID(graph.KindFile, graph.SpanPath(node))]; ok {
 					return true
 				}
 			}

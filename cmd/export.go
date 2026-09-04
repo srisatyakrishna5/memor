@@ -1,8 +1,9 @@
 // export.go — memor export
 //
-// Writes agent-authored nodes and the edges between them as JSONL. Structural
-// nodes are excluded by default: they are reproducible from source with a
-// single `memor build`, so shipping them would be shipping a derived artifact.
+// Writes agent-authored nodes as JSONL, with their attachments intact.
+// Structural nodes are excluded by default: they are reproducible from source
+// with a single `memor build`, so shipping them would be shipping a derived
+// artifact.
 package cmd
 
 import (
@@ -40,23 +41,12 @@ func runExport(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	keep := make(map[string]struct{}, g.NodeCount())
 	var records []graph.Record
 	for _, n := range g.Nodes() {
 		if !exportAll && n.Origin() == graph.OriginExtract {
 			continue
 		}
-		keep[n.ID] = struct{}{}
 		records = append(records, graph.NodeRecord(n))
-	}
-	for _, e := range g.Edges() {
-		if _, ok := keep[e.From]; !ok {
-			continue
-		}
-		if _, ok := keep[e.To]; !ok {
-			continue
-		}
-		records = append(records, graph.EdgeRecord(e))
 	}
 
 	lines, err := graph.Encode(records)

@@ -5,23 +5,37 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/memor-dev/memor/internal/constants"
 	"github.com/memor-dev/memor/internal/graph"
 	"github.com/memor-dev/memor/internal/retrieve"
 	"github.com/memor-dev/memor/internal/session"
+	"github.com/memor-dev/memor/internal/vcs"
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-// Five tools, matching v1's count. Bloated tool sets and ambiguous tool
-// selection are a leading agent failure mode, so capability is folded into
-// existing tools rather than added alongside them.
+// Seven tools arranged as an escalation ladder, cheapest first. Bloated tool
+// sets and ambiguous tool selection are a leading agent failure mode, so each
+// tool answers a question the one above it could not.
 //
 // Each description carries a behavioural contract, not an API summary. A
 // description that tells the model what to do with the result is what changes
 // its behaviour; one that only names the arguments does not.
 func (s *Server) register(srv *sdk.Server) {
 	sdk.AddTool(srv, &sdk.Tool{
+		Name:        "repo_brief",
+		Description: "START HERE. Call this first in every conversation, before reading, searching, or listing anything. Costs a few hundred tokens and tells you what this repository is, its top-level layout, which files changed since you last worked here, and what you left unfinished. Changes you have already been shown are marked seen; if nothing is unseen, trust what you already know instead of re-reading the code.",
+		Annotations: readOnly("Repository brief"),
+	}, s.handleBrief)
+
+	sdk.AddTool(srv, &sdk.Tool{
+		Name:        "repo_changes",
+		Description: "List the files that changed since a given commit, or since you last called repo_brief, each with what it does, whether the index still matches it, and whether you have seen it before. Use this after repo_brief when you need to know exactly which files moved. It is far cheaper than diffing or re-reading the tree.",
+		Annotations: readOnly("Repository changes"),
+	}, s.handleChanges)
+
+	sdk.AddTool(srv, &sdk.Tool{
 		Name:        "repo_map",
-		Description: "Load a task-ranked map of this repository: the files that matter, their function and type signatures with exact line ranges, what imports what, what depends on them, and the decisions recorded about them in past conversations. Call this once at the start of a conversation, before reading or searching any file. Pass the user's request verbatim as the query so results are ranked for the task at hand.",
+		Description: "Load a task-ranked view of the code: the files that matter for this request, their function and type signatures with exact line ranges, what they import, what depends on them, and the decisions recorded about them. Use it when you need code you have not seen yet. Pass the user's request verbatim as the query, and narrow with paths when you already know the area.",
 		Annotations: readOnly("Load repository map"),
 	}, s.handleRepoMap)
 
@@ -39,56 +53,111 @@ func (s *Server) register(srv *sdk.Server) {
 
 	sdk.AddTool(srv, &sdk.Tool{
 		Name:        "remember",
-		Description: "Record something worth knowing in future conversations: a decision and the alternative it rejected, a bug and its root cause, a command or workflow, a stated preference, or a summary of what a file does. Call at the end of a turn. Attach it to the files and symbols it explains so the next conversation finds it in place rather than in a list. Write self-contained sentences that will make sense months from now without this conversation.",
+		Description: "Record something worth knowing in future conversations: a decision and the alternative it rejected, a bug and its root cause, a command or workflow, a stated preference, or a summary of what a file does. Call at the end of a turn. Set task and status to leave a note about unfinished work, which repo_brief hands back next session. Attach it to the files and symbols it explains, and write self-contained sentences that will make sense months from now.",
 		Annotations: writes("Remember a fact"),
 	}, s.handleRemember)
 
 	sdk.AddTool(srv, &sdk.Tool{
-		Name:        "graph_status",
-		Description: "Report the state of this repository's graph: node and edge counts, how many indexed files have drifted from disk, pending writes, on-disk size, and the token budget. Use it to check whether the map is populated and trustworthy before relying on it.",
-		Annotations: readOnly("Graph status"),
+		Name:        "memor_status",
+		Description: "Report whether memor's index can be trusted: node counts, how many indexed files have drifted from disk, which commit was indexed and how far behind HEAD it is, pending writes, and on-disk size. Call it if another tool returns something that looks wrong.",
+		Annotations: readOnly("Memor status"),
 	}, s.handleStatus)
 }
 
-// RepoMapInput selects what slice of the graph to return.
+// BriefInput identifies the calling agent so watermarks stay per-agent.
+type BriefInput struct {
+	Agent   string `json:"agent,omitempty" jsonschema:"stable identifier for you as a client, so 'what changed since last time' is tracked per agent; omit to use the shared default"`
+	Journal int    `json:"journal,omitempty" jsonschema:"maximum unfinished journal entries to return; defaults to 5"`
+}
+
+func (s *Server) handleBrief(_ context.Context, _ *sdk.CallToolRequest, in BriefInput) (*sdk.CallToolResult, session.Brief, error) {
+	sess, err := s.session()
+	if err != nil {
+		return nil, session.Brief{}, err
+	}
+	// Reading the brief is what makes it the agent's new baseline, so the
+	// watermark advances here rather than requiring a second call to confirm.
+	brief, err := sess.Brief(session.BriefOptions{
+		Agent:   in.Agent,
+		Journal: in.Journal,
+		Advance: true,
+	})
+	if err != nil {
+		return nil, session.Brief{}, fmt.Errorf("read brief: %w", err)
+	}
+	s.invalidate()
+	return nil, brief, nil
+}
+
+// ChangesInput selects the comparison point.
+type ChangesInput struct {
+	Agent string `json:"agent,omitempty" jsonschema:"the same client identifier passed to repo_brief, so changes you have already been shown are marked seen"`
+	Since string `json:"since,omitempty" jsonschema:"commit SHA to compare against; omit to compare against the commit memor last indexed"`
+	Limit int    `json:"limit,omitempty" jsonschema:"maximum changed paths to return; defaults to 50"`
+}
+
+func (s *Server) handleChanges(_ context.Context, _ *sdk.CallToolRequest, in ChangesInput) (*sdk.CallToolResult, session.ChangeSet, error) {
+	sess, err := s.session()
+	if err != nil {
+		return nil, session.ChangeSet{}, err
+	}
+	limit := in.Limit
+	if limit <= 0 {
+		limit = 50
+	}
+	set, err := sess.Changes(in.Agent, strings.TrimSpace(in.Since), limit)
+	if err != nil {
+		return nil, session.ChangeSet{}, fmt.Errorf("read changes: %w", err)
+	}
+	return nil, set, nil
+}
+
+// RepoMapInput selects what slice of the repository to return.
 type RepoMapInput struct {
 	Query     string   `json:"query,omitempty" jsonschema:"what the user is trying to do, in their own words; used to rank the map for the task"`
+	Paths     []string `json:"paths,omitempty" jsonschema:"restrict results to these directory or file path prefixes"`
 	Tags      []string `json:"tags,omitempty" jsonschema:"optional topic tags to boost, such as auth or deploy"`
 	OpenFiles []string `json:"openFiles,omitempty" jsonschema:"paths already open in the editor; they anchor the ranking around what the user is looking at"`
-	Budget    int      `json:"budget,omitempty" jsonschema:"maximum tokens to return; defaults to the project's configured budget"`
+	Budget    int      `json:"budget,omitempty" jsonschema:"maximum tokens to return; defaults to 2500"`
 	Limit     int      `json:"limit,omitempty" jsonschema:"maximum nodes to return; omit to let the token budget decide"`
 }
 
 func (s *Server) handleRepoMap(_ context.Context, _ *sdk.CallToolRequest, in RepoMapInput) (*sdk.CallToolResult, any, error) {
-	sess, err := s.session()
+	sess, g, ix, err := s.load()
 	if err != nil {
 		return nil, nil, err
 	}
-	g, ix, err := sess.Graph()
-	if err != nil {
-		return nil, nil, fmt.Errorf("load graph: %w", err)
-	}
 	if g.NodeCount() == 0 {
-		return textResult("The graph is empty. Run 'memor build' in a terminal to index this repository, then call repo_map again."), nil, nil
+		return textResult("Nothing is indexed. Run 'memor build' in a terminal to index this repository, then call repo_map again."), nil, nil
 	}
 
 	openFiles := make([]string, 0, len(in.OpenFiles))
 	for _, f := range in.OpenFiles {
 		openFiles = append(openFiles, sess.RelPath(f))
 	}
+	paths := make([]string, 0, len(in.Paths))
+	for _, p := range in.Paths {
+		paths = append(paths, sess.RelPath(p))
+	}
+
+	budget := in.Budget
+	if budget <= 0 {
+		budget = constants.DefaultMapBudget
+	}
 
 	result := retrieve.Retrieve(g, ix, sess.Cfg, retrieve.Query{
 		Text:      in.Query,
 		Tags:      in.Tags,
 		OpenFiles: openFiles,
-		Budget:    in.Budget,
+		Paths:     paths,
+		Budget:    budget,
 		Limit:     in.Limit,
 	})
 
 	// Underfilling is correct. A short block beats a padded one, because a
 	// plausible-but-wrong node degrades the answer more than a missing one.
 	if len(result.Nodes) == 0 {
-		return textResult("Nothing in the graph is relevant to that query. Read the files you need directly, then call remember to record what you learn."), nil, nil
+		return textResult("Nothing indexed is relevant to that query. Read the specific file you need, then call remember to record what you learn."), nil, nil
 	}
 
 	if report, err := sess.Status(); err == nil && report.NeedsRebuild() {
@@ -103,7 +172,7 @@ func (s *Server) handleRepoMap(_ context.Context, _ *sdk.CallToolRequest, in Rep
 // SymbolFindInput names the symbol to locate.
 type SymbolFindInput struct {
 	Name  string `json:"name" jsonschema:"exact or partial symbol name, such as Compact or Graph.AddNode"`
-	Limit int    `json:"limit,omitempty" jsonschema:"maximum matches to return; defaults to 10"`
+	Limit int    `json:"limit,omitempty" jsonschema:"maximum matches to return; defaults to 5"`
 }
 
 // SymbolFindOutput carries located definitions.
@@ -127,23 +196,19 @@ type SymbolResult struct {
 }
 
 func (s *Server) handleSymbolFind(_ context.Context, _ *sdk.CallToolRequest, in SymbolFindInput) (*sdk.CallToolResult, SymbolFindOutput, error) {
-	sess, err := s.session()
-	if err != nil {
-		return nil, SymbolFindOutput{}, err
-	}
 	name := strings.TrimSpace(in.Name)
 	if name == "" {
 		return nil, SymbolFindOutput{}, fmt.Errorf("name is required")
 	}
 
-	g, _, err := sess.Graph()
+	sess, g, _, err := s.load()
 	if err != nil {
-		return nil, SymbolFindOutput{}, fmt.Errorf("load graph: %w", err)
+		return nil, SymbolFindOutput{}, err
 	}
 
 	limit := in.Limit
 	if limit <= 0 {
-		limit = 10
+		limit = 5
 	}
 	matches := g.FindSymbols(name)
 	if len(matches) > limit {
@@ -157,8 +222,8 @@ func (s *Server) handleSymbolFind(_ context.Context, _ *sdk.CallToolRequest, in 
 			Kind:      n.MetaValue(graph.MetaSymKind),
 			Signature: n.Text,
 			Status:    graph.FileStatus(sess.Root, n),
-			Callers:   relatedNames(g, n.ID, graph.EdgeCalls, false),
-			Callees:   relatedNames(g, n.ID, graph.EdgeCalls, true),
+			Callers:   capList(n.MetaList(graph.MetaCallers)),
+			Callees:   capList(n.MetaList(graph.MetaCalls)),
 			Notes:     explainNotes(g, n.ID),
 		}
 		if n.Span != nil {
@@ -169,6 +234,17 @@ func (s *Server) handleSymbolFind(_ context.Context, _ *sdk.CallToolRequest, in 
 		results = append(results, result)
 	}
 	return nil, SymbolFindOutput{Count: len(results), Results: results}, nil
+}
+
+// maxRelated caps caller and callee lists. A widely used helper has dozens of
+// callers and listing them all costs more than it tells the agent.
+const maxRelated = 8
+
+func capList(values []string) []string {
+	if len(values) > maxRelated {
+		return values[:maxRelated]
+	}
+	return values
 }
 
 // SymbolReadInput identifies the body to fetch.
@@ -189,7 +265,7 @@ type SymbolReadOutput struct {
 }
 
 func (s *Server) handleSymbolRead(_ context.Context, _ *sdk.CallToolRequest, in SymbolReadInput) (*sdk.CallToolResult, SymbolReadOutput, error) {
-	sess, err := s.session()
+	sess, g, _, err := s.load()
 	if err != nil {
 		return nil, SymbolReadOutput{}, err
 	}
@@ -214,11 +290,6 @@ func (s *Server) handleSymbolRead(_ context.Context, _ *sdk.CallToolRequest, in 
 		}, nil
 	}
 
-	g, _, err := sess.Graph()
-	if err != nil {
-		return nil, SymbolReadOutput{}, fmt.Errorf("load graph: %w", err)
-	}
-
 	var target *graph.Node
 	for _, candidate := range g.FindSymbols(name) {
 		if path != "" && (candidate.Span == nil || candidate.Span.Path != path) {
@@ -229,7 +300,7 @@ func (s *Server) handleSymbolRead(_ context.Context, _ *sdk.CallToolRequest, in 
 	}
 	if target == nil || target.Span == nil {
 		return nil, SymbolReadOutput{}, fmt.Errorf(
-			"no indexed symbol named %q — call symbol_find first, or run 'memor build' if the graph is out of date", name)
+			"no indexed symbol named %q — call symbol_find first, or run 'memor build' if the index is out of date", name)
 	}
 
 	source, err := graph.ReadSpan(sess.Root, target.Span)
@@ -256,6 +327,8 @@ type RememberInput struct {
 	Symbols    []string `json:"symbols,omitempty" jsonschema:"symbol names this fact explains"`
 	Expires    string   `json:"expires,omitempty" jsonschema:"optional expiry as YYYY-MM-DD or a day count such as 30d; use for temporary workarounds"`
 	Supersedes string   `json:"supersedes,omitempty" jsonschema:"id of an existing memory this replaces"`
+	Task       string   `json:"task,omitempty" jsonschema:"short label for the piece of work this note belongs to, such as 'migrate auth to oauth'"`
+	Status     string   `json:"status,omitempty" jsonschema:"open, done, or blocked; open and blocked entries are returned by repo_brief next session"`
 	Summary    string   `json:"summary,omitempty" jsonschema:"when describing one file, a one-line statement of what it does and why it exists; requires exactly one entry in files"`
 	Patterns   string   `json:"patterns,omitempty" jsonschema:"conventions callers must follow when using that file"`
 	Logic      string   `json:"logic,omitempty" jsonschema:"step-by-step flow, for a file whose control flow is not obvious"`
@@ -286,6 +359,7 @@ func (s *Server) handleRemember(_ context.Context, _ *sdk.CallToolRequest, in Re
 		if err != nil {
 			return nil, RememberOutput{}, err
 		}
+		s.invalidate()
 		return nil, RememberOutput{ID: node.ID, Kind: "file", Attached: []string{node.Name}}, nil
 	}
 
@@ -297,10 +371,13 @@ func (s *Server) handleRemember(_ context.Context, _ *sdk.CallToolRequest, in Re
 		Symbols:    in.Symbols,
 		Expires:    in.Expires,
 		Supersedes: in.Supersedes,
+		Task:       in.Task,
+		Status:     in.Status,
 	})
 	if err != nil {
 		return nil, RememberOutput{}, err
 	}
+	s.invalidate()
 
 	attached := append(append([]string{}, in.Files...), in.Symbols...)
 	return nil, RememberOutput{
@@ -311,18 +388,19 @@ func (s *Server) handleRemember(_ context.Context, _ *sdk.CallToolRequest, in Re
 	}, nil
 }
 
-// StatusOutput summarizes the graph.
+// StatusOutput summarizes whether the index can be trusted.
 type StatusOutput struct {
-	Nodes       int            `json:"nodes" jsonschema:"total nodes in the graph"`
-	Edges       int            `json:"edges" jsonschema:"total edges"`
-	ByKind      map[string]int `json:"byKind,omitempty" jsonschema:"node counts keyed by kind"`
-	Pending     int            `json:"pending" jsonschema:"records written but not yet compacted"`
-	Fresh       int            `json:"fresh" jsonschema:"indexed files that still match disk"`
-	Stale       int            `json:"stale" jsonschema:"indexed files that changed since the last build"`
-	Missing     int            `json:"missing" jsonschema:"indexed files that no longer exist"`
-	Bytes       int64          `json:"bytes" jsonschema:"on-disk size of the .memor directory"`
-	TokenBudget int            `json:"tokenBudget" jsonschema:"configured retrieval token budget"`
-	Advice      string         `json:"advice" jsonschema:"what to do next given the current state"`
+	Nodes         int            `json:"nodes" jsonschema:"total indexed nodes"`
+	ByKind        map[string]int `json:"byKind,omitempty" jsonschema:"node counts keyed by kind"`
+	Pending       int            `json:"pending" jsonschema:"records written but not yet compacted"`
+	Fresh         int            `json:"fresh" jsonschema:"indexed files that still match disk"`
+	Stale         int            `json:"stale" jsonschema:"indexed files that changed since the last build"`
+	Missing       int            `json:"missing" jsonschema:"indexed files that no longer exist"`
+	IndexedCommit string         `json:"indexedCommit,omitempty" jsonschema:"commit the last build indexed"`
+	CommitsBehind int            `json:"commitsBehind,omitempty" jsonschema:"commits made since the index was built"`
+	Bytes         int64          `json:"bytes" jsonschema:"on-disk size of the .memor directory"`
+	TokenBudget   int            `json:"tokenBudget" jsonschema:"configured retrieval token budget"`
+	Advice        string         `json:"advice" jsonschema:"what to do next given the current state"`
 }
 
 func (s *Server) handleStatus(_ context.Context, _ *sdk.CallToolRequest, _ struct{}) (*sdk.CallToolResult, StatusOutput, error) {
@@ -336,58 +414,40 @@ func (s *Server) handleStatus(_ context.Context, _ *sdk.CallToolRequest, _ struc
 	}
 
 	out := StatusOutput{
-		Nodes:       report.Nodes,
-		Edges:       report.Edges,
-		ByKind:      report.ByKind,
-		Pending:     report.Pending,
-		Fresh:       report.Fresh,
-		Stale:       report.Stale,
-		Missing:     report.Missing,
-		Bytes:       report.Bytes,
-		TokenBudget: report.TokenBudget,
+		Nodes:         report.Nodes,
+		ByKind:        report.ByKind,
+		Pending:       report.Pending,
+		Fresh:         report.Fresh,
+		Stale:         report.Stale,
+		Missing:       report.Missing,
+		IndexedCommit: report.IndexedCommit,
+		Bytes:         report.Bytes,
+		TokenBudget:   report.TokenBudget,
+	}
+	if report.IndexedCommit != "" {
+		if behind, err := vcs.CommitsBetween(sess.Root, report.IndexedCommit); err == nil {
+			out.CommitsBehind = behind
+		}
 	}
 	switch {
 	case report.Nodes == 0:
-		out.Advice = "The graph is empty. Run 'memor build' to index this repository."
+		out.Advice = "Nothing is indexed. Run 'memor build' to index this repository."
 	case report.NeedsRebuild():
 		out.Advice = "Enough indexed files have drifted that the map may mislead you. Run 'memor build'."
+	case out.CommitsBehind > 0:
+		out.Advice = fmt.Sprintf("The index is %d commits behind HEAD. Run 'memor build' to refresh it.", out.CommitsBehind)
 	default:
-		out.Advice = "The graph is current. Call repo_map to load it."
+		out.Advice = "The index is current. Call repo_brief to orient, then repo_map for a task-scoped view."
 	}
 	return nil, out, nil
 }
 
-func relatedNames(g *graph.Graph, id string, kind graph.EdgeKind, outgoing bool) []string {
-	edges := g.In(id)
-	if outgoing {
-		edges = g.Out(id)
-	}
-
-	var out []string
-	for _, e := range edges {
-		if e.Kind != kind {
-			continue
-		}
-		other := e.From
-		if outgoing {
-			other = e.To
-		}
-		if n, ok := g.Node(other); ok {
-			out = append(out, n.Name)
-		}
-	}
-	return out
-}
-
+// explainNotes returns the recorded decisions attached to a node.
 func explainNotes(g *graph.Graph, id string) []string {
-	var out []string
-	for _, e := range g.In(id) {
-		if e.Kind != graph.EdgeExplains {
-			continue
-		}
-		if n, ok := g.Node(e.From); ok {
-			out = append(out, n.Text)
-		}
+	memories := g.Explaining(id)
+	out := make([]string, 0, len(memories))
+	for _, m := range memories {
+		out = append(out, m.Text)
 	}
-	return out
+	return capList(out)
 }

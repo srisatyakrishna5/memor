@@ -70,20 +70,21 @@ func FileStatus(projectRoot string, n *Node) string {
 	}
 }
 
-// Report summarizes the state of a project's graph.
+// Report summarizes the state of a project's store.
 type Report struct {
-	Nodes       int
-	Edges       int
-	ByKind      map[string]int
-	Pending     int
-	Fresh       int
-	Stale       int
-	Missing     int
-	StaleRatio  float64
-	Bytes       int64
-	TokenBudget int
-	BuiltAt     int64
-	Topics      []string
+	Nodes         int
+	ByKind        map[string]int
+	Pending       int
+	Fresh         int
+	Stale         int
+	Missing       int
+	StaleRatio    float64
+	Bytes         int64
+	TokenBudget   int
+	BuiltAt       int64
+	Tags          []string
+	IndexedCommit string
+	IndexedAt     int64
 }
 
 // Status inspects a loaded graph against the working tree.
@@ -93,14 +94,17 @@ func Status(paths store.Paths, projectRoot string, g *Graph, cfg config.Config) 
 		return Report{}, fmt.Errorf("count log records: %w", err)
 	}
 
+	state := store.ReadState(paths.State)
 	rep := Report{
-		Nodes:       g.NodeCount(),
-		Edges:       g.EdgeCount(),
-		ByKind:      g.CountByKind(),
-		Pending:     pending,
-		Bytes:       paths.FootprintBytes(),
-		TokenBudget: cfg.Memory.TokenBudget,
-		BuiltAt:     g.BuiltAt,
+		Nodes:         g.NodeCount(),
+		ByKind:        g.CountByKind(),
+		Pending:       pending,
+		Bytes:         paths.FootprintBytes(),
+		TokenBudget:   cfg.Memory.TokenBudget,
+		BuiltAt:       g.BuiltAt,
+		Tags:          g.AllTags(),
+		IndexedCommit: state.IndexedCommit,
+		IndexedAt:     state.IndexedAt,
 	}
 
 	for _, f := range g.NodesOfKind(KindFile) {
@@ -116,11 +120,6 @@ func Status(paths store.Paths, projectRoot string, g *Graph, cfg config.Config) 
 	if total := rep.Fresh + rep.Stale + rep.Missing; total > 0 {
 		rep.StaleRatio = float64(rep.Stale+rep.Missing) / float64(total)
 	}
-
-	for _, t := range g.NodesOfKind(KindTopic) {
-		rep.Topics = append(rep.Topics, t.Name)
-	}
-	sort.Strings(rep.Topics)
 	return rep, nil
 }
 

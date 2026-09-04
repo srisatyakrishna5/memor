@@ -45,12 +45,10 @@ func runClean(cmd *cobra.Command, args []string) error {
 	}
 
 	if !cleanAll {
-		// graph.idx and graph.db are derived by definition, and the blob cache
-		// is a cache. Dropping them costs one rebuild and nothing else.
-		for _, path := range []string{paths.Idx, paths.DB} {
-			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-				return err
-			}
+		// graph.db is a derived projection and the blob directory is a cache.
+		// Dropping them costs one rebuild and nothing else.
+		if err := os.Remove(paths.DB); err != nil && !os.IsNotExist(err) {
+			return err
 		}
 		if err := os.RemoveAll(paths.Blobs); err != nil {
 			return err

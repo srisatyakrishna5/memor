@@ -1,6 +1,7 @@
 package tests
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"testing"
@@ -27,8 +28,8 @@ func TestNodeIDIsContentAddressed(t *testing.T) {
 
 func TestKindRoundTrip(t *testing.T) {
 	kinds := []graph.Kind{
-		graph.KindFile, graph.KindSym, graph.KindPkg, graph.KindExt,
-		graph.KindDoc, graph.KindMem, graph.KindTopic,
+		graph.KindFile, graph.KindSym, graph.KindPkg,
+		graph.KindDoc, graph.KindMem,
 	}
 	for _, kind := range kinds {
 		parsed, ok := graph.ParseKind(kind.String())
@@ -36,16 +37,33 @@ func TestKindRoundTrip(t *testing.T) {
 			t.Errorf("kind %v did not round-trip through %q", kind, kind.String())
 		}
 	}
+}
 
-	edges := []graph.EdgeKind{
-		graph.EdgeImports, graph.EdgeContains, graph.EdgeCalls, graph.EdgeRefs,
-		graph.EdgeTagged, graph.EdgeSupersedes, graph.EdgeExplains,
+// Metadata lists are the replacement for edges, so they must survive the JSON
+// round-trip through graph.snap unchanged and in a stable order.
+func TestMetaListRoundTrip(t *testing.T) {
+	node := graph.FileNode("a.go", "", 1, "aaaaaa", "go")
+	node.SetMetaList(graph.MetaImports, []string{"internal/store", "internal/graph", "internal/store", ""})
+
+	got := node.MetaList(graph.MetaImports)
+	if len(got) != 2 || got[0] != "internal/graph" || got[1] != "internal/store" {
+		t.Fatalf("expected deduplicated sorted values, got %v", got)
 	}
-	for _, kind := range edges {
-		parsed, ok := graph.ParseEdgeKind(kind.String())
-		if !ok || parsed != kind {
-			t.Errorf("edge kind %v did not round-trip through %q", kind, kind.String())
-		}
+
+	lines, err := graph.Encode([]graph.Record{graph.NodeRecord(node)})
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	if bytes.ContainsRune(lines[0], '\n') {
+		t.Error("a record must stay on one line")
+	}
+
+	decoded := graph.Decode(lines, "test")
+	if len(decoded) != 1 || decoded[0].Node == nil {
+		t.Fatal("expected one node record")
+	}
+	if rt := decoded[0].Node.MetaList(graph.MetaImports); len(rt) != 2 || rt[0] != "internal/graph" {
+		t.Errorf("metadata list did not survive the round-trip: %v", rt)
 	}
 }
 
@@ -72,42 +90,14 @@ func TestAgentSummarySurvivesExtraction(t *testing.T) {
 	}
 }
 
-func TestRemoveNodeDropsIncidentEdges(t *testing.T) {
-	g := graph.New()
-	file := graph.FileNode("a.go", "", 1, "aaaaaa", "go")
-	sym := graph.SymNode("a.go", "Run", "func Run()", "func", &graph.Span{Path: "a.go"})
-	g.AddNode(file)
-	g.AddNode(sym)
-	g.AddEdge(graph.Edge{From: file.ID, To: sym.ID, Kind: graph.EdgeContains})
-
-	g.RemoveNode(sym.ID)
-	if g.EdgeCount() != 0 {
-		t.Errorf("expected incident edges to be removed, %d remain", g.EdgeCount())
-	}
-}
-
-// A dangling edge is a distractor waiting to happen: it would let the walk
-// reach a node that no longer exists.
-func TestResolveDropsDanglingEdges(t *testing.T) {
-	g := graph.New()
-	file := graph.FileNode("a.go", "", 1, "aaaaaa", "go")
-	g.AddNode(file)
-	g.AddEdge(graph.Edge{From: file.ID, To: "deadbeefdead", Kind: graph.EdgeImports})
-
-	g.Resolve()
-	if g.EdgeCount() != 0 {
-		t.Errorf("expected the dangling edge to be dropped, %d remain", g.EdgeCount())
-	}
-}
-
 func TestPruneExtractedKeepsAgentNodes(t *testing.T) {
 	g := graph.New()
 
 	memory := graph.MemNode("Compaction archives before truncating", graph.MemSemantic, 0)
 	file := graph.FileNode("a.go", "", 1, "aaaaaa", "go")
+	memory.SetMetaList(graph.MetaExplains, []string{file.ID})
 	g.AddNode(memory)
 	g.AddNode(file)
-	g.AddEdge(graph.Edge{From: memory.ID, To: file.ID, Kind: graph.EdgeExplains})
 
 	g.PruneExtracted()
 
@@ -117,8 +107,11 @@ func TestPruneExtractedKeepsAgentNodes(t *testing.T) {
 	if _, ok := g.Node(file.ID); ok {
 		t.Error("expected the extracted file node to be pruned")
 	}
-	if g.EdgeCount() != 0 {
-		t.Error("expected the explains edge to be dropped with its target")
+	// The attachment is content-addressed by path, so re-extracting the same
+	// file must restore the link rather than orphan the memory.
+	g.AddNode(graph.FileNode("a.go", "", 1, "bbbbbb", "go"))
+	if notes := g.Explaining(file.ID); len(notes) != 1 {
+		t.Errorf("expected the attachment to resolve again after a rebuild, got %d", len(notes))
 	}
 }
 
@@ -126,13 +119,8 @@ func TestLogRoundTripThroughSnapshot(t *testing.T) {
 	paths, cfg := newProject(t)
 
 	memory := graph.MemNode("BM25 is rebuilt per call by design", graph.MemSemantic, time.Now().Unix())
-	topic := graph.TopicNode("retrieval")
-	records := []graph.Record{
-		graph.NodeRecord(memory),
-		graph.NodeRecord(topic),
-		graph.EdgeRecord(graph.Edge{From: memory.ID, To: topic.ID, Kind: graph.EdgeTagged, W: 1}),
-	}
-	if err := graph.Append(paths.Log, records); err != nil {
+	memory.SetMetaList(graph.MetaTags, []string{"retrieval"})
+	if err := graph.Append(paths.Log, []graph.Record{graph.NodeRecord(memory)}); err != nil {
 		t.Fatalf("Append: %v", err)
 	}
 
@@ -151,8 +139,8 @@ func TestLogRoundTripThroughSnapshot(t *testing.T) {
 	if node.Text != memory.Text {
 		t.Errorf("content changed through the snapshot: %q", node.Text)
 	}
-	if tags := g.Tags(memory.ID); len(tags) != 1 || tags[0] != "retrieval" {
-		t.Errorf("expected the tagged edge to survive, got %v", tags)
+	if tags := node.Tags(); len(tags) != 1 || tags[0] != "retrieval" {
+		t.Errorf("expected the tag to survive, got %v", tags)
 	}
 }
 
@@ -163,11 +151,11 @@ func TestCompactionDropsSupersededMemories(t *testing.T) {
 
 	old := graph.MemNode("Use MD5 for content hashing", graph.MemSemantic, time.Now().Unix())
 	replacement := graph.MemNode("Use SHA-256 for content hashing", graph.MemSemantic, time.Now().Unix())
+	replacement.SetMetaList(graph.MetaSupersedes, []string{old.ID})
 
 	if err := graph.Append(paths.Log, []graph.Record{
 		graph.NodeRecord(old),
 		graph.NodeRecord(replacement),
-		graph.EdgeRecord(graph.Edge{From: replacement.ID, To: old.ID, Kind: graph.EdgeSupersedes, W: 1}),
 	}); err != nil {
 		t.Fatalf("Append: %v", err)
 	}
@@ -214,9 +202,9 @@ func TestExpiredMemoriesAreArchived(t *testing.T) {
 	}
 }
 
-// graph.idx is derived by definition: deleting it must cost one rebuild and
-// nothing else.
-func TestIndexIsDisposable(t *testing.T) {
+// The term index is derived by definition: it must be rebuildable from the
+// store alone, with no cached file to drift out of sync.
+func TestIndexIsDerivedFromTheStore(t *testing.T) {
 	paths, cfg := newProject(t)
 
 	memory := graph.MemNode("Spans point into the repo rather than copying it", graph.MemSemantic, time.Now().Unix())
@@ -232,15 +220,13 @@ func TestIndexIsDisposable(t *testing.T) {
 		t.Fatalf("Load: %v", err)
 	}
 
-	first := graph.LoadIndex(paths, g)
-	if err := os.Remove(paths.Idx); err != nil && !os.IsNotExist(err) {
-		t.Fatalf("remove index: %v", err)
+	first := graph.BuildIndex(g).Seeds("spans repo", 5)
+	second := graph.BuildIndex(g).Seeds("spans repo", 5)
+	if len(first) == 0 {
+		t.Fatal("expected the memory to be findable by its own words")
 	}
-	second := graph.LoadIndex(paths, g)
-
-	if first.Fingerprint != second.Fingerprint {
-		t.Errorf("expected a deleted index to rebuild identically: %s vs %s",
-			first.Fingerprint, second.Fingerprint)
+	if len(first) != len(second) || first[0] != second[0] {
+		t.Errorf("expected two builds to agree: %v vs %v", first, second)
 	}
 }
 

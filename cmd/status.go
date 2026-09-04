@@ -1,7 +1,7 @@
 // status.go — memor status
 //
-// Reports node and edge counts, how much of the index has drifted from disk,
-// pending writes, and on-disk footprint.
+// Reports node counts, how much of the index has drifted from disk, which
+// commit was indexed, pending writes, and on-disk footprint.
 package cmd
 
 import (
@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/memor-dev/memor/internal/vcs"
 	"github.com/spf13/cobra"
 )
 
@@ -32,7 +33,6 @@ func runStatus(cmd *cobra.Command, args []string) error {
 
 	fmt.Printf("Project:   %s\n", sess.Root)
 	fmt.Printf("Nodes:     %d\n", report.Nodes)
-	fmt.Printf("Edges:     %d\n", report.Edges)
 
 	kinds := make([]string, 0, len(report.ByKind))
 	for kind := range report.ByKind {
@@ -50,17 +50,31 @@ func runStatus(cmd *cobra.Command, args []string) error {
 	if report.BuiltAt > 0 {
 		fmt.Printf("Built:     %s\n", time.Unix(report.BuiltAt, 0).Format(time.RFC3339))
 	}
-	if len(report.Topics) > 0 {
-		fmt.Printf("Topics:    %s\n", strings.Join(report.Topics, ", "))
+	if report.IndexedCommit != "" {
+		line := fmt.Sprintf("Indexed:   %s", shortSHA(report.IndexedCommit))
+		if behind, err := vcs.CommitsBetween(sess.Root, report.IndexedCommit); err == nil && behind > 0 {
+			line += fmt.Sprintf(" (%d commits behind HEAD)", behind)
+		}
+		fmt.Println(line)
+	}
+	if len(report.Tags) > 0 {
+		fmt.Printf("Tags:      %s\n", strings.Join(report.Tags, ", "))
 	}
 
 	switch {
 	case report.Nodes == 0:
-		fmt.Println("\nThe graph is empty. Run 'memor build' to index this repository.")
+		fmt.Println("\nNothing is indexed. Run 'memor build' to index this repository.")
 	case report.NeedsRebuild():
 		fmt.Println("\nEnough indexed files have drifted that the map may mislead an agent. Run 'memor build'.")
 	}
 	return nil
+}
+
+func shortSHA(sha string) string {
+	if len(sha) > 8 {
+		return sha[:8]
+	}
+	return sha
 }
 
 func humanBytes(n int64) string {

@@ -1,26 +1,15 @@
 package graph
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
 	"math"
-	"os"
 	"sort"
 	"strings"
-
-	"github.com/memor-dev/memor/internal/constants"
-	"github.com/memor-dev/memor/internal/store"
 )
 
-// Index holds everything derived from the graph: term postings for BM25 and
-// offline PageRank. It is disposable by definition — deleting graph.idx costs
-// one rebuild and nothing else, which is why the binary format lives here and
-// never in the canonical snapshot.
+// Index holds the BM25 term postings derived from the graph. It is rebuilt on
+// every load and never persisted: without edges there is no offline signal
+// worth caching, and a cache that can drift is a source of silent misranking.
 type Index struct {
-	Fingerprint string             `json:"fp"`
-	Rank        map[string]float64 `json:"r"`
-
 	ids       []string
 	pos       map[string]int
 	termFreq  []map[string]int
@@ -30,18 +19,16 @@ type Index struct {
 	docCount  int
 }
 
-// BuildIndex computes postings and PageRank over a graph.
+// BuildIndex computes term postings over a graph.
 func BuildIndex(g *Graph) *Index {
 	nodes := g.Nodes()
 	ix := &Index{
-		Fingerprint: fingerprint(g),
-		Rank:        make(map[string]float64, len(nodes)),
-		ids:         make([]string, len(nodes)),
-		pos:         make(map[string]int, len(nodes)),
-		termFreq:    make([]map[string]int, len(nodes)),
-		docLen:      make([]float64, len(nodes)),
-		docFreq:     make(map[string]int),
-		docCount:    len(nodes),
+		ids:      make([]string, len(nodes)),
+		pos:      make(map[string]int, len(nodes)),
+		termFreq: make([]map[string]int, len(nodes)),
+		docLen:   make([]float64, len(nodes)),
+		docFreq:  make(map[string]int),
+		docCount: len(nodes),
 	}
 
 	total := 0.0
@@ -49,7 +36,7 @@ func BuildIndex(g *Graph) *Index {
 		ix.ids[i] = n.ID
 		ix.pos[n.ID] = i
 
-		terms := tokenize(indexText(g, n))
+		terms := tokenize(indexText(n))
 		ix.docLen[i] = float64(len(terms))
 		total += ix.docLen[i]
 
@@ -65,20 +52,20 @@ func BuildIndex(g *Graph) *Index {
 	if ix.docCount > 0 {
 		ix.avgDocLen = total / float64(ix.docCount)
 	}
-
-	ix.Rank = pageRank(g)
 	return ix
 }
 
 // indexText is the searchable surface of a node: its name, its text, and the
 // tags attached to it. Path segments are split so "internal/engine/context.go"
 // matches a query for "engine".
-func indexText(g *Graph, n *Node) string {
+func indexText(n *Node) string {
 	var sb strings.Builder
 	sb.WriteString(splitIdentifier(n.Name))
 	sb.WriteByte(' ')
 	sb.WriteString(n.Text)
-	for _, tag := range g.Tags(n.ID) {
+	sb.WriteByte(' ')
+	sb.WriteString(n.MetaValue(MetaPurpose))
+	for _, tag := range n.Tags() {
 		sb.WriteByte(' ')
 		sb.WriteString(tag)
 	}
@@ -91,14 +78,9 @@ func indexText(g *Graph, n *Node) string {
 	// query naming a function scores its bare symbol node highly and the file
 	// that defines it not at all, so the answer arrives without its context.
 	if n.Kind == KindFile {
-		for _, e := range g.Out(n.ID) {
-			if e.Kind != EdgeContains {
-				continue
-			}
-			if sym, ok := g.Node(e.To); ok && sym.Kind == KindSym {
-				sb.WriteByte(' ')
-				sb.WriteString(splitIdentifier(sym.Name))
-			}
+		for _, sym := range n.MetaList(MetaSymbols) {
+			sb.WriteByte(' ')
+			sb.WriteString(splitIdentifier(sym))
 		}
 	}
 	return sb.String()
@@ -212,7 +194,8 @@ func (ix *Index) BM25(nodeID, query string) float64 {
 }
 
 // Seeds returns node IDs whose indexed text matches the query at all, ordered
-// by raw BM25. They anchor the graph walk.
+// by raw BM25. Nothing expands beyond them: a node that does not match the
+// query never enters the result set.
 func (ix *Index) Seeds(query string, limit int) []string {
 	if strings.TrimSpace(query) == "" {
 		return nil
@@ -253,115 +236,4 @@ func (ix *Index) MaxBM25(query string) float64 {
 		}
 	}
 	return best
-}
-
-// MaxRank reports the highest PageRank value, used for the same normalization.
-func (ix *Index) MaxRank() float64 {
-	best := 0.0
-	for _, v := range ix.Rank {
-		if v > best {
-			best = v
-		}
-	}
-	return best
-}
-
-// pageRank computes offline PageRank over the edge graph. Structure earns a
-// node relevance independently of the query, which is what stops a rarely-named
-// but heavily depended-on file from being invisible.
-func pageRank(g *Graph) map[string]float64 {
-	nodes := g.Nodes()
-	n := len(nodes)
-	rank := make(map[string]float64, n)
-	if n == 0 {
-		return rank
-	}
-
-	initial := 1.0 / float64(n)
-	for _, node := range nodes {
-		rank[node.ID] = initial
-	}
-
-	outDegree := make(map[string]float64, n)
-	for _, node := range nodes {
-		outDegree[node.ID] = float64(len(g.Out(node.ID)))
-	}
-
-	next := make(map[string]float64, n)
-	for iter := 0; iter < constants.PageRankIterations; iter++ {
-		dangling := 0.0
-		for _, node := range nodes {
-			if outDegree[node.ID] == 0 {
-				dangling += rank[node.ID]
-			}
-			next[node.ID] = 0
-		}
-
-		for _, node := range nodes {
-			degree := outDegree[node.ID]
-			if degree == 0 {
-				continue
-			}
-			share := rank[node.ID] / degree
-			for _, e := range g.Out(node.ID) {
-				next[e.To] += share * float64(e.W)
-			}
-		}
-
-		base := (1-constants.PageRankDamping)/float64(n) +
-			constants.PageRankDamping*dangling/float64(n)
-		for _, node := range nodes {
-			rank[node.ID] = base + constants.PageRankDamping*next[node.ID]
-		}
-	}
-	return rank
-}
-
-// fingerprint identifies the exact graph an index was built from, so a stale
-// graph.idx is detected instead of silently misranking results.
-func fingerprint(g *Graph) string {
-	h := sha256.New()
-	for _, n := range g.Nodes() {
-		h.Write([]byte(n.ID))
-		h.Write([]byte{0})
-	}
-	for _, e := range g.Edges() {
-		h.Write([]byte(e.From))
-		h.Write([]byte(e.To))
-		h.Write([]byte{byte(e.Kind)})
-	}
-	return hex.EncodeToString(h.Sum(nil))[:16]
-}
-
-// LoadIndex returns a usable index, reusing the cached PageRank when graph.idx
-// still matches the graph and recomputing it otherwise.
-func LoadIndex(paths store.Paths, g *Graph) *Index {
-	ix := &Index{}
-	data, err := os.ReadFile(paths.Idx)
-	if err == nil && json.Unmarshal(data, ix) == nil && ix.Fingerprint == fingerprint(g) {
-		full := BuildIndex(g)
-		full.Rank = ix.Rank
-		return full
-	}
-
-	full := BuildIndex(g)
-	_ = SaveIndex(paths, full)
-	return full
-}
-
-// SaveIndex persists the derived index. Failure is not fatal: the next load
-// simply recomputes.
-func SaveIndex(paths store.Paths, ix *Index) error {
-	data, err := json.Marshal(ix)
-	if err != nil {
-		return err
-	}
-	return store.WriteFileAtomic(paths.Idx, data)
-}
-
-func removeIndex(paths store.Paths) error {
-	if err := os.Remove(paths.Idx); err != nil && !os.IsNotExist(err) {
-		return err
-	}
-	return nil
 }
