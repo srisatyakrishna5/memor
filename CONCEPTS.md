@@ -1,458 +1,474 @@
 ---
 title: Memor Concepts
-description: An accessible guide to the data flow, storage model, and algorithms used by Memor
-ms.date: 2026-08-10
-ms.topic: concept
+description: How the repository knowledge graph is built, stored, ranked, and served
+---
+
+# Memor Concepts
+
+How Memor works, end to end. Read [README.md](README.md) first for what it does;
+this document explains why it is built the way it is. The reasoning behind the
+v2 design, including the alternatives that were rejected, is in
+[ADR-0001](docs/adr/adr-0001-memor-v2-code-knowledge-graph.md).
+
 ---
 
 ## What Memor Solves
 
-AI coding assistants do not naturally remember earlier conversations. A new chat
-may see the repository, but it does not know why a team chose PostgreSQL, how
-production is deployed, or which workaround already failed.
+An AI coding assistant begins every session with no structural model of your
+repository. Answering *"where is authentication handled and what calls it?"*
+requires a search-read-search loop that pulls whole files into the context
+window. Three costs follow:
 
-Memor adds a small local memory layer for that missing history. It has four
-goals:
+1. **Direct token cost.** A 500-line source file is roughly 4,000 tokens. Ten
+   such reads consume 40,000 tokens before any reasoning begins.
+2. **Quality cost.** Token spend is not neutral. Accuracy degrades as inputs
+   grow, and it degrades most when the relevant fact sits in the middle of a
+   long context. A *plausible but wrong* result is worse than no result: a
+   single topically-related distractor measurably reduces accuracy, and several
+   compound the effect.
+3. **Repetition cost.** The same exploration repeats every session, because
+   nothing is persisted.
 
-* Save new memories without rewriting the entire store
-* Keep complete memory data after compaction
-* Return useful context within a predictable token budget
-* Work without a cloud service, daemon, or database server
-* Share the same memory across multiple AI coding tools
+Memor indexes the repository into one graph, persists what past conversations
+learned, and serves a task-ranked map inside a token budget.
 
-The implementation stays intentionally small. Memor uses local files,
-deterministic scoring, and one in-memory BM25 ranker. It does not need a general
-search engine for a memory set that is already bounded by a token budget.
+---
 
 ## The Big Picture
 
-A memory moves through three stages:
+Everything is a **node**. Nodes are connected by typed **edges**.
 
-```text
-AI assistant
-    |
-    | memor add
-    v
-memory.wal                  new writes, one JSON object per line
-    |
-    | memor compact
-    v
-deduplicate -> score -> fit to budget
-    |                         |
-    | kept                    | rejected
-    v                         v
-memory.snapshot.jsonl     memory.archive
-    |
-    | render a compact view
-    v
-memory.db
-    |
-    | memor context
-    v
-ranked context for the next conversation
+```
+                    ┌────────────┐
+                    │   topic    │◄──── tagged ──── any node
+                    └────────────┘
+
+  ┌────────┐             ┌────────┐            ┌────────┐
+  │  pkg   │─ contains ─►│  file  │─ contains ─►│  sym   │
+  └────────┘             └────────┘             └────────┘
+                          │      ▲                │    ▲
+                    imports      └── imports ──┐  │    │
+                          ▼                    │  └ calls
+                    ┌────────┐            ┌────────┐
+                    │  ext   │            │  file  │
+                    └────────┘            └────────┘
+                                               ▲
+  ┌────────┐                                   │
+  │  mem   │──────────── explains ─────────────┘
+  └────────┘
 ```
 
-New entries are appended quickly to the write-ahead log. Compaction later turns
-the accumulated data into a bounded active snapshot. Retrieval ranks that active
-data for the question being asked.
+v1 had three parallel subsystems — memories, knowledge, and code — each with its
+own storage, reader, and ranker. `Context()` therefore built **two independent
+BM25 indexes** and ran **two packing loops** against a single budget, which is
+what produced silent duplicate emission and silent drops. One node type collapses
+that seam, so a single index and a single packer make the defect inexpressible.
 
-This resembles one part of a log-structured merge tree, but Memor is not a
-database. It borrows the idea of append first and compact later without adding
-tables, transactions, background workers, or persistent query indexes.
+### Node kinds
 
-### Runtime Layers
+| Kind | Holds |
+|---|---|
+| `file` | A source file: path, line count, content hash, summary |
+| `sym` | A function, method, type, or constant with its exact byte span |
+| `pkg` | A directory or module |
+| `ext` | A third-party dependency with no body in this repository |
+| `doc` | A section of a markdown document |
+| `mem` | A recorded decision, fix, workflow, or preference |
+| `topic` | A tag, promoted to a first-class node |
 
-The implementation has four small layers:
+### Edge kinds
 
-1. Cobra commands validate input and coordinate operations.
-2. The store package reads and writes files under `.memor/`.
-3. The engine compacts, ranks, and packs memories and knowledge.
-4. The index and token packages provide BM25 scoring and token estimation.
+| Edge | From → To | Produced by |
+|---|---|---|
+| `imports` | file → file, pkg, or ext | L0 extraction |
+| `contains` | pkg → file, file → sym | L0 / L1 extraction |
+| `calls` | sym → sym | L1 extraction |
+| `refs` | sym → sym, non-call use | L1 extraction |
+| `tagged` | any → topic | Tags on memories and docs |
+| `supersedes` | node → node | An explicit replacement |
+| `explains` | mem → file or sym | Recording a fact against code |
 
-No process stays running after a command finishes. Each command opens the files
-it needs, performs one bounded operation, and exits.
+`explains` is the capability no comparable repository-map tool has. Others supply
+structure. Memor can additionally bind *"a persistent index was rejected on
+purpose"* to the exact symbol where a future agent would otherwise add one, and
+it resurfaces there without anyone searching for it. It costs one edge.
 
-## A Memory's Journey
+---
 
-Consider this command:
+## Spans, Not Copies
 
-```bash
-memor add -s "#deploy #api: Production deploys use pnpm turbo deploy"
-```
+A symbol node stores `path + byte range + line range + content hash + signature`.
+The body stays on disk in the repository and is fetched on demand.
 
-Memor handles it in five steps:
+| Requirement | Why a span satisfies it |
+|---|---|
+| Index repository content | Every byte is addressable and retrievable in one seek |
+| Work offline | Reading a byte range from a local file is as offline as it gets |
+| Stay native to the repository | The graph is coordinates into the repo, with no second copy to drift |
+| Minimal footprint | Storing bodies would duplicate `.git/objects`, already a compressed content-addressed store of the same bytes |
+| Minimal tokens | The agent gets a ~12-token pointer and pulls a ~200-token body only when it decides it needs one |
 
-1. Parse the tags and content into a memory entry.
-2. Generate a timestamp and content-derived ID.
-3. Append the complete entry to `memory.wal` as JSONL.
-4. Trigger compaction when the WAL reaches its configured threshold.
-5. Include the entry in future context when its text, tags, type, and age make
-   it relevant.
+Spans also keep staleness detectable **per file**: a hash mismatch identifies
+exactly one drifted file. Storing bodies would create two sources of truth and
+force a disk hash on every read — the I/O the design set out to avoid.
 
-Each stage has one job. The WAL keeps writes cheap, compaction controls growth,
-and retrieval adapts the same stored memories to different questions.
+Bodies are cached lazily under `blobs/`, never mirrored eagerly. A body enters
+the cache only when `symbol_read` serves it, keyed by its content hash, so
+serving a stale entry is structurally impossible.
+
+---
 
 ## Local Files And Their Roles
 
-Memor stores project data under `.memor/`:
-
-```text
+```
 .memor/
-|-- config.toml
-|-- memory.wal
-|-- memory.snapshot.jsonl
-|-- memory.db
-|-- memory.archive
-`-- knowledge.db
+├── config.toml      # Configuration
+├── graph.log        # Append-only JSONL: nodes, edges, tombstones
+├── graph.snap       # Compacted canonical JSONL (lossless)
+├── graph.db         # Rendered projection (write-only output)
+├── graph.idx        # DERIVED: postings and PageRank. Deletable
+├── graph.archive    # Evicted nodes
+├── blobs/           # LRU body cache, hash-keyed, size-capped
+└── .lock
 ```
 
-| File | Purpose |
-|------|---------|
-| `config.toml` | Active token, compaction, and knowledge settings |
-| `memory.wal` | New and updated entries waiting for compaction |
-| `memory.snapshot.jsonl` | Complete canonical form of active memories |
-| `memory.db` | Compact text projection for AI context |
-| `memory.archive` | Entries removed by decay or the active token budget |
-| `knowledge.db` | Indexed summaries of project documentation sections |
+Four rules keep this honest:
 
-Two snapshot files may look redundant, but they serve different audiences.
-`memory.snapshot.jsonl` preserves every field needed by the application.
-`memory.db` uses fewer tokens and is easier for an AI assistant to scan. Keeping
-these roles separate avoids forcing one format to be both lossless and minimal.
+1. **`graph.log` is the only append target.** Every write in the system is a
+   node, an edge, or a tombstone record.
+2. **`graph.snap` is the only lossless artifact.** Everything else regenerates
+   from it.
+3. **`graph.idx` is disposable by definition.** Delete it and the next command
+   rebuilds it. The compact binary-ish format lives here and nowhere else, which
+   buys load speed without creating an opaque source of truth.
+4. **`graph.db` is write-only.** Nothing parses it back. This is why v2 has no
+   bespoke format parser to keep in sync with its writer — v1 needed one only
+   because `knowledge.db` was both a projection and an input.
 
-## Append-Only Writes With JSONL
+---
 
-`memory.wal` is a JSON Lines file. Every non-empty line is one complete memory:
+## Append-Only Writes
+
+Every write appends one JSONL record to `graph.log`:
 
 ```jsonl
-{"t":1786356000,"y":"s","id":"4f92ea20bb5d","tags":["deploy","api"],"c":"Production deploys use pnpm turbo deploy"}
+{"o":"n","n":{"i":"7271f9a926dd","k":"mem","n":"s","x":"Archive before replacing the snapshot","t":1772800000,"m":{"t":"s","org":"agent"}}}
+{"o":"e","g":{"f":"7271f9a926dd","t":"3b1c8e2a4f90","k":"explains","w":1}}
 ```
 
-Appending a line is cheaper and simpler than reading and rewriting a large JSON
-array. JSONL also limits malformed data to an individual line. The reader warns
-about a malformed line and continues with later valid entries.
+`o` is the operation: `n` (node), `e` (edge), `-n` and `-e` (tombstones). Append
+is O(1), needs no coordination beyond a short-lived lock, and survives a crash
+because a partial line is simply skipped on read.
 
-The WAL is truncated only after compaction has archived rejected entries and
-committed the new active snapshot. If compaction fails earlier, the WAL remains
-available for another attempt.
+A malformed line warns and is skipped. One bad record must never destroy the
+store.
 
-Implementation: [internal/store/wal.go](internal/store/wal.go)
+---
 
 ## Content-Addressed IDs
 
-Memor derives an entry ID from normalized content instead of generating a random
-UUID. It trims surrounding whitespace, converts the text to lowercase, hashes it
-with SHA-256, and keeps the first 12 hexadecimal characters:
+A node's ID is `sha256(kind + "\0" + normalize(identity))[:12]`, where
+`normalize` lowercases and trims.
 
-$$
-id(c) = hex(SHA256(lower(trim(c))))[0:12]
-$$
+| Kind | Identity |
+|---|---|
+| `file` | Project-relative path |
+| `sym` | `path#name` — so two same-named symbols in different files stay distinct |
+| `pkg` | Directory |
+| `ext` | Import specifier |
+| `doc` | `source#section` |
+| `mem` | The memory text itself |
+| `topic` | The tag |
 
-This gives equivalent content the same ID regardless of capitalization.
-Content-derived IDs provide two useful behaviors:
+Three properties follow:
 
-* Duplicate facts written by different tools collapse into one active entry.
-* A newer copy of the same fact replaces the older copy during compaction.
+- **Free deduplication.** Recording the same fact twice yields the same ID, so
+  it collapses to one node rather than accumulating.
+- **Idempotent tools.** An agent that retries `remember` cannot create a
+  duplicate.
+- **Stable references.** `supersedes` and `explains` can name a node without a
+  lookup table.
 
-An entry can also set `Supersedes` to the ID of a different entry. This supports
-changes such as replacing "use Node 20" with "use Node 22" even though the two
-sentences have different IDs.
+Including the kind in the hash means a file named the same as a memory's text
+cannot collide with it.
 
-The shortened hash is a deduplication key. It is not encryption, a signature, or
-proof that content is trustworthy.
+---
 
-Implementation: [internal/memory/types.go](internal/memory/types.go)
+## Extraction
 
-## Memory Types
+Extraction is **tiered** and **deterministic**. No tier makes a network call,
+invokes a model, or requires CGO — the last of which matters because the npm
+installer ships cross-compiled binaries per platform, and tree-sitter's Go
+bindings are mostly C.
 
-Memories are classified by how they help future work:
+| Tier | Scope | Mechanism |
+|---|---|---|
+| **L0** | Files, packages, imports | Line-oriented scan across Go, JS/TS, Python, Java, C#, Rust, Ruby, PHP |
+| **L1** | Symbols, spans, signatures, calls | `go/ast` from the standard library |
+| **L2** | Summaries, patterns, decisions | Agent-authored, merged onto extracted nodes |
 
-| Prefix | Type | Use it for | Default weight |
-|--------|------|------------|---------------:|
-| `@f` | Preference | Style and developer conventions | 1.0 |
-| `@s` | Semantic | Facts, decisions, and architecture | 0.9 |
-| `@p` | Procedural | Commands and repeatable workflows | 0.8 |
-| `@c` | Code | Structured summaries of source files | 0.7 |
-| `@e` | Episodic | Events, fixes, and completed migrations | 0.5 |
+`memor build` prunes every machine-derived node before re-extracting, so deleted
+files and renamed symbols cannot linger as ghosts. Agent-authored memories and
+summaries survive untouched: extraction knows structure but not intent, so it
+must never blank a summary a human or agent wrote.
 
-The type is a ranking signal, not a separate storage system. Preference memories
-receive the strongest default weight because conventions usually remain useful.
-Episodic memories receive a lower default weight because an old event often
-matters less than an active decision or workflow.
+Two exclusions are deliberate:
 
-Code memories can carry structured metadata such as a file path, line count,
-hash, exports, dependencies, summary, patterns, and control flow. The canonical
-snapshot preserves all of it even though the compact view shows only what helps
-the next prompt.
+- **The Go standard library is not modelled.** Every Go file imports `fmt` or
+  `os`, so including them would make `fmt` the highest-PageRank node in the
+  repository while carrying no signal about it.
+- **External dependency edges are damped.** A third-party package is worth
+  showing but must not accumulate rank: it is imported by many files and depends
+  on none of them.
+
+---
+
+## Retrieval
+
+One pipeline, four stages:
+
+```go
+seeds    := Seeds(query, tags, openFiles)   // BM25 plus exact name match
+frontier := Expand(seeds, maxHops)          // weighted graph walk
+scored   := Score(frontier, query)
+kept     := gate(scored, minScore)          // precision floor
+return pack(kept, budget)                   // position-aware
+```
+
+### Scoring
+
+```
+score = 0.30·BM25 + 0.25·proximity + 0.20·PageRank + 0.15·tags + 0.10·recency
+```
+
+The result is multiplied by a kind weight (files outrank symbols, symbols
+outrank bare package nodes) and by a test-file penalty, because a test mentions
+every term the code under test mentions and would otherwise crowd out the
+implementation that answers the question.
+
+**BM25 with shared stemming.** Indexing and querying pass through the same
+tokenizer and the same conservative suffix stripper. Without it a
+natural-language query and a machine-shaped identifier never meet: "compaction"
+and `Compact` share no token, so the file implementing compaction would score
+zero against a question about it. A file node also inherits the names of the
+symbols it contains, so a query naming a function reaches the file that defines
+it rather than only the bare symbol.
+
+**Proximity** is a decayed walk outward from the seeds, weighted per edge kind.
+A file contains dozens of symbols and a topic tags dozens of nodes, so
+propagating those at full strength would flood the frontier with everything
+structurally adjacent to one good hit.
+
+**PageRank** is computed offline at build time over the edge graph. Structure
+earns a node relevance independently of the query, which is what stops a
+rarely-named but heavily depended-on file from being invisible.
+
+### The precision floor
+
+`gate()` **drops rather than fills**. If nothing clears the threshold, the block
+returned is short.
+
+Underfilling is correct. One distractor measurably degrades output and four
+compound it, so a short answer beats a padded one. Structural weight alone
+cannot clear the floor either: a node must be lexically matched or directly
+adjacent to something that was. Without that rule a heavily depended-on symbol
+has high PageRank in *every* query and gets returned for questions it has
+nothing to do with.
+
+### Position-aware packing
+
+`pack()` places the strongest results **first and last**, with the weakest
+survivors in the middle. Accuracy is highest at both ends of a context window
+and lowest in the middle, so emitting in plain descending order wastes the
+recency-favoured tail.
+
+Packing also suppresses redundancy. A memory rendered inline on the file it
+explains is never also emitted standalone, and a symbol listed inside a selected
+file block is never emitted on its own. This is the guard that makes the v1
+double-emission defect inexpressible.
+
+---
 
 ## Compaction
 
-Compaction turns the existing snapshot and pending WAL entries into a new active
-set:
+Compaction folds `graph.log` into `graph.snap`:
 
-1. Read the canonical snapshot and WAL.
-2. Put WAL entries after snapshot entries so newer copies take precedence.
-3. Deduplicate by ID.
-4. Remove entries that were superseded or expired.
-5. Score each remaining entry for long-term retention.
-6. Archive entries below the configured minimum score.
-7. Fit the remaining entries into the active token budget.
-8. Archive entries that do not fit.
-9. Commit the new snapshot and truncate the WAL.
+1. **Parse** — read the snapshot, then the log, so later records win.
+2. **Decay** — score memory nodes; archive those below the threshold, plus
+   expired and superseded ones. Structural nodes are never archived: extraction
+   regenerates them, so archiving would only churn the archive.
+3. **Commit** — archive **before** replacing the active snapshot, so a failure
+   mid-write is retryable rather than lossy.
+4. **Truncate** — remove only the prefix of the log that was actually consumed.
+5. **Project** — regenerate `graph.db` and drop the derived index.
 
-### Retention Score
+A memory's retention score is its subtype weight, decayed by age, boosted by how
+many nodes it connects to. A decision explaining three files outranks an isolated
+note of the same age. Preferences do not decay: they are stated once and expected
+to hold.
 
-The retention score answers a storage question: which memories deserve space in
-the active snapshot even when no search query is present?
+`AutoCompact` runs opportunistically after a write once the log passes a
+threshold. If another process holds the lock it **skips rather than blocks**, and
+it writes nothing to stdout so it cannot corrupt MCP's JSON-RPC framing.
 
-$$
-S_{retention} = W_{type} \times D_{age} \times (1 + B_{sharedTags})
-$$
+---
 
-The terms are deliberately straightforward:
+## Concurrency And Recovery
 
-* $W_{type}$ comes from the memory type configuration.
-* $D_{age}$ gradually decreases as a memory gets older.
-* $B_{sharedTags}$ gives a small boost to memories connected to active topics.
+A long-lived MCP server writes alongside CLI invocations, so these invariants are
+load-bearing and each has a test behind it:
 
-The shared-tag boost is calculated directly from active entries. It does not
-need a persistent tag index.
+| # | Invariant | Why it matters |
+|---|---|---|
+| I1 | One lock per `.memor/` directory, not per file | The only reason compaction can span archive, snapshot, and truncate atomically |
+| I2 | Commit order: archive, then snapshot, then truncate | A failure at any point leaves a retryable state |
+| I3 | Truncate only the consumed prefix | An append racing a compaction survives; `Truncate(0)` would silently drop it |
+| I4 | Locked and unlocked function variants are split | Compaction cannot self-deadlock |
+| I5 | Lock contention means skip, not fail, for auto-compaction | Housekeeping never stalls a tool call |
+| I6 | The OS releases the lock on process exit | No stale-lock recovery code, no lease, no PID file |
+| I7 | Auto-compaction writes nothing to stdout | A stray print corrupts MCP stdio framing |
+| I8 | Content-addressed IDs | Free deduplication and idempotent re-adds |
+| I9 | A malformed line warns and continues | One bad record cannot destroy the store |
 
-### One Budget Decision
+Snapshot writes are atomic: content is written to a temporary file and renamed
+into place, with a move-aside fallback because Windows refuses to rename over an
+open file.
 
-Snapshot serialization calculates the token cost of the exact text that will be
-written. It returns two explicit lists: written and evicted. This makes every
-candidate accountable and prevents a second hidden trimming step from dropping
-data.
+---
 
-Rejected entries are archived before the active snapshot is replaced. Archive
-writes are idempotent by content ID, so retrying a partially completed
-compaction does not create duplicate archive records.
+## Staleness
 
-Implementation: [internal/engine/compact.go](internal/engine/compact.go) and
-[internal/store/snapshot.go](internal/store/snapshot.go)
+Every file node carries the content hash recorded when it was indexed.
 
-## Canonical Snapshot And Compact View
+- **fresh** — the file on disk still matches.
+- **stale** — the file changed since indexing.
+- **missing** — the file no longer exists.
 
-The canonical snapshot uses JSONL because the application needs exact
-timestamps, provenance, expiry, supersession, and code metadata. The compact
-view leaves out fields that do not help the next AI response.
+`symbol_read` refuses to serve a span from a drifted file. Handing back the wrong
+lines under a correct-looking line number is worse than refusing, because the
+agent has no way to detect it.
 
-`memory.db` may look like this:
+When enough of the graph has drifted, `repo_map` and `graph_status` say so and
+name the fix. A stale graph is worse than no graph.
 
-```text
-@mem v1 | 3 entries | budget:15000 | compacted:2026-08-10T12:00:00Z
+---
 
-@s #architecture: The API uses PostgreSQL [2026-08-10]
-@p #deploy: Production deploys use pnpm turbo deploy [2026-08-09]
-@f #typescript: Prefer unknown with type guards [perm]
-```
+## The Agent Surface
 
-When `memory.snapshot.jsonl` exists, it is the authority for programmatic reads.
-`memory.db` remains the compact, human-readable projection. Older projects that
-only have `memory.db` are still readable; the next compaction creates the
-canonical file.
+Five MCP tools. Bloated tool sets and ambiguous tool selection are a leading
+agent failure mode, so capability is folded into existing tools rather than added
+alongside them.
 
-Snapshot files are replaced through temporary files. On platforms that cannot
-rename over an existing file, Memor keeps a temporary backup and restores it if
-replacement fails.
+| Tool | Replaces |
+|---|---|
+| `repo_map` | Reading files to find out where anything is |
+| `symbol_find` | grep and workspace search |
+| `symbol_read` | Whole-file reads |
+| `remember` | Losing the decision when the conversation ends |
+| `graph_status` | Guessing whether the map is trustworthy |
 
-## Retrieval With BM25
+Each description carries a **behavioural contract**, not an API summary. A
+description that tells the model what to do with the result changes its
+behaviour; one that only names the arguments does not.
 
-Compaction decides what stays active. Retrieval answers a different question:
-which active memories are useful for this request?
+This is also why behavioural rules live in tool descriptions rather than a
+markdown template: they load with the tool, cannot be edited away by a user, and
+are versioned with the binary. `memor init` therefore owns two files outside
+`.memor/` — `.vscode/mcp.json`, because an MCP server cannot discover itself, and
+a fenced three-line block in `AGENTS.md`, because Copilot cannot be told to read
+a file it does not already know about.
 
-Memor builds a BM25 scorer in memory over every active entry's content and tags.
-BM25 is a standard keyword-ranking method with two useful properties:
-
-* Repeating a word many times gives diminishing returns.
-* A focused short memory is not automatically outranked by a long memory.
-
-In plain language, a memory scores well when it contains meaningful words from
-the query and those words are not common across every memory. Memor uses the
-conventional BM25 defaults $k_1=1.2$ and $b=0.75$.
-
-Implementation: [internal/index/bm25.go](internal/index/bm25.go)
-
-## Final Context Ranking
-
-BM25 is one part of the final score:
-
-$$
-S_{context} = 0.4S_{BM25} + 0.2S_{tags} + 0.2W_{type} + 0.2D_{age}
-$$
-
-This combines four understandable signals:
-
-* Query text matching the memory content and tags
-* Tags explicitly requested by the caller
-* The configured importance of the memory type
-* The age of the memory
-
-When no query is supplied, BM25 contributes zero. Type and age still produce a
-useful order. Tag-only queries scan tags directly because the active set is
-already bounded.
-
-`memor reinforce <id>` refreshes an entry's timestamp by appending an updated
-copy to the WAL. Normal deduplication applies the update during compaction, so no
-separate recency database is needed.
-
-Implementation: [internal/engine/context.go](internal/engine/context.go)
-
-## Token Budgeting
-
-AI models count text in tokens rather than characters. Exact tokenization varies
-between model families, so Memor uses a dependency-free estimate for local
-budgeting.
-
-The estimator blends word count with character count. The word estimate uses
-about 1.3 tokens per word, while the character estimate uses about one token per
-3.8 characters. Their average is rounded to the nearest whole token.
-
-This is not a billing calculator. It is a deterministic way to keep memory
-output bounded. The same estimator is used when fitting the active snapshot and
-when packing memories and knowledge into `memor context` output.
-
-Implementation: [internal/token/token.go](internal/token/token.go)
-
-## Project Knowledge
-
-Memories capture facts learned during work. Knowledge indexing handles existing
-project documents such as instructions, skills, and runbooks.
-
-Memor processes a document by:
-
-1. Splitting it at level-two Markdown headings.
-2. Turning each heading into a stable section name.
-3. Keeping a short section summary.
-4. Extracting a small set of topic tags.
-5. Saving the source path and SHA-256 hash for refresh checks.
-
-Project scanning walks the repository once and supports recursive `**` path
-patterns. It skips `.git`, `.memor`, `.venv`, and `node_modules` so dependency
-and generated content do not flood the knowledge store.
-
-Knowledge receives a configurable share of the context budget. Matching
-sections are ranked with BM25. If no section matches, that space is returned to
-project memories instead of being wasted.
-
-Implementation: [internal/engine/knowledge.go](internal/engine/knowledge.go)
+---
 
 ## Configuration
 
-`config.toml` exposes settings that currently change runtime behavior:
+`.memor/config.toml`. Every setting has a working default, and a partial file
+keeps the defaults for everything it omits — otherwise an author who sets only
+`token_budget` would silently get a zero `min_score` and lose the precision gate.
 
 ```toml
 [memory]
-token_budget = 15000
-wal_max_entries = 2
+token_budget = 15000       # Retrieval budget
+log_max_records = 64       # Auto-compaction threshold
+max_memory_nodes = 2000    # Retention cap
 
-[compaction.type_weights]
-preference = 1.0
-semantic = 0.9
-procedural = 0.8
-episodic = 0.5
-code = 0.7
+[memory.decay]
+rate = 0.03                # Age decay per day
+min_score = 0.1            # Archive threshold
 
-[compaction.decay]
-rate = 0.03
-min_score = 0.1
+[graph]
+enabled = true             # Kill switch: false disables all extraction
+symbols = true             # L1 symbol extraction
+max_file_kb = 512          # Skip generated bundles
 
-[knowledge]
+[graph.cache]
 enabled = true
-scan_paths = [".github/**/*.md", "**/SKILL.md", "CONTRIBUTING.md"]
-budget_share = 0.4
+max_bytes = 262144         # 256 KB hard cap on the body cache
+
+[retrieval]
+max_hops = 2
+min_score = 0.12           # Precision floor
+max_symbols_per_file = 8
 ```
 
-Older project configurations may still contain settings that were removed from
-the implementation. The TOML decoder ignores unknown keys, so those files can
-continue loading while users migrate to the smaller active configuration.
+`graph.enabled = false` reverts Memor to storing and retrieving agent-authored
+memories only, with no repository extraction.
 
-## End-To-End Context Flow
+---
 
-When an assistant runs:
+## Migrating From v1
 
-```bash
-memor context --budget 10000 --query "deploy the API"
-```
+A v1 store is migrated automatically on the first v2 command; `memor migrate`
+makes it explicit. It is idempotent, because a second run finds no v1 files.
 
-the engine follows this flow:
+| v1 | v2 |
+|---|---|
+| `Entry{Type: s/e/p/f}` | `Node{Kind: mem}` with the subtype in metadata |
+| `Entry.Tags` | `tagged` edges to `topic` nodes |
+| `Entry.Supersedes` | A `supersedes` edge, with IDs remapped |
+| `CodeMeta.FilePath`, `LOC`, `Hash` | `Node{Kind: file}` plus a span |
+| `CodeMeta.Exports` | `contains` edges to `sym` nodes |
+| `CodeMeta.Deps` | `imports` edges |
+| `CodeMeta.Summary` | `Node.Text` |
+| `KnowledgeSection` | `Node{Kind: doc}` |
 
-```text
-1. Load canonical project memories
-2. Add pending WAL entries
-3. Add user-level memories when available
-4. Deduplicate and apply supersession
-5. Build BM25 over active content and tags
-6. Combine BM25, tag, type, and age scores
-7. Reserve part of the budget for knowledge
-8. Pack memories in score order
-9. Pack matching knowledge sections
-10. Return unused knowledge space to memories when needed
-```
+v1 `Deps` were persisted but never traversed. Migration is where they become
+load-bearing, so an existing user gets a partial graph immediately — before any
+extraction runs.
 
-The result contains only the text selected for the current request. Complete
-entries remain local on disk.
+The v1 files are renamed to `*.v1.bak` rather than deleted. A migration that
+destroys the only copy of the data is not a migration.
 
-## Failure And Recovery
-
-The order of file operations protects recoverability:
-
-* A failed append is reported before success.
-* Automatic compaction runs only after a successful append.
-* A failed automatic compaction is reported as a warning and leaves the WAL
-    available for retry.
-* Rejected entries are archived before active data is replaced.
-* Archive retries skip IDs already present.
-* The canonical snapshot is written before the compact view, so a failed view
-    update does not discard complete entry metadata.
-* Snapshot replacement uses temporary files and rollback where needed.
-* The WAL is truncated last.
-
-These choices do not turn the files into a fully transactional database. They do
-protect the important invariant: a failed maintenance step should leave a
-recoverable copy of each memory.
+---
 
 ## Security And Privacy
 
-Memor does not send memories to a cloud service and does not collect telemetry.
-`memor init` adds `.memor/` to `.gitignore` so project memories remain outside
-normal source control operations.
+- All data stays local. No cloud, no telemetry, no network calls.
+- `.memor/` is gitignored by `memor init`.
+- Bodies are never copied into `.memor/`. The graph stores coordinates into
+  files git already tracks.
+- The blob cache is keyed by content hash and capped in size.
+- Never store secrets, API keys, passwords, or PII in memories.
 
-The pre-commit hook performs best-effort compaction and never blocks a commit.
-The `.gitignore` entry, not the hook, is what prevents `.memor/` from being
-committed.
-
-Local storage is not a secret vault. Memories should not contain passwords, API
-keys, access tokens, private keys, or personal data that does not belong in the
-project workspace.
+---
 
 ## Deliberate Omissions
 
-The active set is constrained by the token budget, so direct BM25 scoring and
-inline metadata checks are sufficient for the current workload. Memor does not
-currently use:
+| Not included | Why |
+|---|---|
+| Embeddings and vector search | Requires a model over the network or bundled; similarity returns code that *resembles* the query, which is exactly the distractor class that hurts most. "Calls", "imports", and "defined-in" are the relations an agent needs, and similarity does not encode them |
+| A graph database or query language | Requires a persistent server and a large prompt surface for the agent to learn. Progressive disclosure is achieved with one narrow expansion tool instead |
+| LLM-based extraction | Costs a model call per text unit, scaling with repository size, and makes indexing non-deterministic |
+| A daemon or background worker | Each command performs one bounded operation and exits |
+| Mirroring source into `.memor/` | Duplicates `.git/objects`, and two sources of truth make staleness undetectable without hashing on every read |
+| Committing the graph | Deferred, not rejected. It needs a merge driver and `.gitattributes` work that is not on the critical path |
 
-* Trigram posting lists
-* Bloom filters
-* Persistent tag maps
-* Access-recency rings
-* Embeddings or vector databases
-* Background daemons or file watchers
-* Plugin systems for command registration
-* Multiple compaction strategies
-
-Each omitted component would add files, synchronization rules, failure modes,
-and concepts for contributors to learn. It should return only if measured
-workloads reveal a problem that the simpler design cannot solve.
+---
 
 ## Where To Go Next
 
-This is the canonical architecture and concepts guide. For installation,
-commands, and contributor setup, see [README.md](README.md).
-
-The shortest useful mental model is:
-
-```text
-append complete memories -> compact safely -> rank active context -> stay local
-```
+- [README.md](README.md) — installation, commands, and quick start
+- [ADR-0001](docs/adr/adr-0001-memor-v2-code-knowledge-graph.md) — the full design rationale, evidence, and rejected alternatives
+- `memor rules` — the protocol Memor expects an agent to follow
+- `internal/graph/` — nodes, edges, log, snapshot, index, projection
+- `internal/retrieve/` — the single ranking and packing pipeline

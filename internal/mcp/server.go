@@ -1,8 +1,10 @@
-// Package mcp serves memor's memory engine over the Model Context Protocol.
+// Package mcp serves memor's knowledge graph over the Model Context Protocol.
 //
-// Exposing memory as tools rather than CLI invocations removes the dependency on
-// an agent voluntarily following prose rules in AGENTS.md: hosts surface tools to
-// the model directly, with typed arguments and validated schemas.
+// Exposing the graph as tools rather than CLI invocations removes the
+// dependency on an agent voluntarily following prose rules in a markdown file:
+// hosts surface tools to the model directly, with typed arguments and validated
+// schemas, and the descriptions ship with the binary rather than living in a
+// file a user can edit away.
 //
 // The stdio transport uses stdout for JSON-RPC framing, so nothing in this
 // package may write to stdout. Diagnostics go to stderr.
@@ -11,13 +13,9 @@ package mcp
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io"
-	"path/filepath"
-	"strings"
 
-	"github.com/memor-dev/memor/internal/config"
-	"github.com/memor-dev/memor/internal/store"
+	"github.com/memor-dev/memor/internal/session"
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -27,25 +25,30 @@ import (
 // normal exit path rather than a failure.
 const codeServerClosing = -32004
 
-// instructions is injected into the model's system prompt by MCP hosts. It
-// carries the workflow that AGENTS.md previously had to spell out.
-const instructions = `Memor is this project's persistent memory. It survives across conversations.
+// Instructions is injected into the model's system prompt by MCP hosts. It
+// carries the workflow a repository AGENTS.md previously had to spell out, and
+// `memor rules` prints the same text so the CLI and the tools never disagree.
+const Instructions = `Memor holds a persistent map of this repository plus everything learned about it in past conversations.
 
-Call memory_context once at the start of a conversation, before other tools, to
-load prior decisions, conventions, and workflows.
+Call repo_map once at the start of a conversation, before reading or searching
+any file. Pass the user's request as the query. The result gives you the files
+that matter, their signatures with exact line ranges, what depends on what, and
+the decisions behind them.
 
-Call memory_add at the end of a turn whenever a decision was made, a bug was
+Use symbol_find instead of grep to locate a function, method, or type. Use
+symbol_read instead of reading a whole file: it returns the exact lines a symbol
+occupies, not the four hundred lines around it.
+
+Call remember at the end of a turn whenever a decision was made, a bug was
 diagnosed, a workflow was established, or the user stated a preference. Record
-why something was chosen and what was rejected, not just what changed. Skip
-trivia and anything already stored.
+why something was chosen and what was rejected, not just what changed. Attach it
+to the files or symbols it explains so the next conversation finds it in place.
 
-Call code_get before reading a source file. When it reports status "fresh",
-trust the stored summary and skip the read. When it reports "stale" or the file
-is unknown, read the file and then call code_save.
+If repo_map reports the graph is stale or empty, run 'memor build' in a terminal.
 
 Never edit files under .memor/ directly. Use these tools.`
 
-// Server adapts the memor engine to MCP.
+// Server adapts the memor graph to MCP.
 type Server struct {
 	// start is the directory the server was launched from. The project root is
 	// resolved from it on every call so the server survives a `memor init` that
@@ -70,6 +73,12 @@ func (s *Server) Run(ctx context.Context) error {
 	return err
 }
 
+// Connect serves the memor tools over a caller-supplied transport. Run is the
+// stdio entry point; this is the seam for hosts that bring their own.
+func (s *Server) Connect(ctx context.Context, transport sdk.Transport) (*sdk.ServerSession, error) {
+	return s.sdkServer().Connect(ctx, transport, nil)
+}
+
 func isCleanShutdown(err error) bool {
 	switch {
 	case err == nil,
@@ -87,66 +96,23 @@ func (s *Server) sdkServer() *sdk.Server {
 	srv := sdk.NewServer(
 		&sdk.Implementation{
 			Name:        "memor",
-			Title:       "Memor Project Memory",
-			Description: "Persistent, token-budgeted project memory for AI coding assistants.",
+			Title:       "Memor Repository Graph",
+			Description: "Token-budgeted repository map and persistent project memory for AI coding assistants.",
 			Version:     s.version,
 		},
-		&sdk.ServerOptions{Instructions: instructions},
+		&sdk.ServerOptions{Instructions: Instructions},
 	)
 	s.register(srv)
 	return srv
 }
 
-// session resolves the project root and config for a single tool call.
-func (s *Server) session() (store.Paths, string, config.Config, error) {
-	root := store.FindProjectRoot(s.start)
-	paths := store.ResolvePaths(root)
-	if !paths.Exists() {
-		return store.Paths{}, "", config.Config{}, fmt.Errorf(
-			"memor is not initialized for %s — run 'memor init' in the project root first", s.start)
-	}
-
-	cfg, err := config.Load(paths.Config)
+// session resolves the project root, config, and graph for a single tool call.
+func (s *Server) session() (*session.Session, error) {
+	sess, err := session.Open(s.start)
 	if err != nil {
-		return store.Paths{}, "", config.Config{}, fmt.Errorf("load config: %w", err)
+		return nil, err
 	}
-	return paths, root, cfg, nil
-}
-
-// relPath normalizes an agent-supplied path to a slash-separated path relative
-// to the project root, so code_get and code_save agree on storage keys.
-func relPath(root, p string) string {
-	p = strings.TrimSpace(p)
-	if p == "" {
-		return ""
-	}
-	if filepath.IsAbs(p) {
-		if rel, err := filepath.Rel(root, p); err == nil {
-			p = rel
-		}
-	}
-	return filepath.ToSlash(filepath.Clean(p))
-}
-
-// normalizeTags trims, lowercases, and drops empty or duplicate tags.
-func normalizeTags(tags []string) []string {
-	seen := make(map[string]struct{}, len(tags))
-	out := make([]string, 0, len(tags))
-	for _, t := range tags {
-		t = strings.ToLower(strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(t), "#")))
-		if t == "" {
-			continue
-		}
-		if _, dup := seen[t]; dup {
-			continue
-		}
-		seen[t] = struct{}{}
-		out = append(out, t)
-	}
-	if len(out) == 0 {
-		return nil
-	}
-	return out
+	return sess, nil
 }
 
 func textResult(s string) *sdk.CallToolResult {
@@ -166,8 +132,8 @@ func readOnly(title string) *sdk.ToolAnnotations {
 	}
 }
 
-// writes marks a tool that appends to the WAL. Entries are content-addressed, so
-// repeating a call collapses to the same entry rather than duplicating it.
+// writes marks a tool that appends to graph.log. Nodes are content-addressed,
+// so repeating a call collapses to the same node rather than duplicating it.
 func writes(title string) *sdk.ToolAnnotations {
 	return &sdk.ToolAnnotations{
 		Title:           title,

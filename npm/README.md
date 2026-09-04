@@ -3,9 +3,12 @@ title: npm package for Memor
 description: Install and use Memor through npm
 ---
 
-**Local memory persistence for AI coding assistants.**
+**Repository knowledge graph and persistent memory for AI coding assistants.**
 
-Every AI coding tool starts each conversation cold. Memor stores project context locally and surfaces relevant memories within a token budget.
+Every AI coding tool starts each conversation with no structural model of your
+repository, so it reads whole files to find out where anything is. Memor indexes
+the repository into one graph and hands the assistant a task-ranked map within a
+token budget.
 
 Local files. Ranked context. Zero cloud, zero daemon, zero git commits.
 
@@ -24,51 +27,86 @@ npx @memor-dev/memor init
 ## Quick Start
 
 ```bash
-# Initialize in your project
+# Initialize and index your project
 cd your-project
-memor init
+memor init --build
 ```
 
-`memor init` creates `.memor/` and adds a managed instruction block to `AGENTS.md` so AI tools can read and write memories.
+`memor init` creates `.memor/`, registers the MCP server in `.vscode/mcp.json`,
+and adds a three-line pointer to `AGENTS.md`.
 
-Use `memor init --tools claude,cursor,windsurf` to configure additional AI tools.
+Use `memor init --tools claude,cursor` to register additional MCP hosts.
 
 ## Additional Commands
 
 ```bash
-# Add a memory manually
-memor add -s "#arch #db: PostgreSQL 16 with Drizzle ORM"
+# Print the task-ranked map
+memor context --query "where is auth handled"
 
-# Get context for AI tools
-memor context --budget 10000
+# Locate a definition instead of grepping
+memor symbol find ValidateToken
 
-# Search memories
-memor search "deploy"
+# Read only the lines a symbol occupies
+memor symbol read ValidateToken
 
-# Compact WAL into snapshot
-memor compact
+# Record a decision against the file it explains
+memor remember "OAuth2 with PKCE; sessions rejected as stateful" --file src/auth.ts
+
+# Check size, staleness, and footprint
+memor status
 ```
 
 ## How It Works
 
 ```
-Conversations ──► APPEND to memory.wal (JSONL)
-                       │
-                       ▼
-                  COMPACTION (score → dedupe → budget)
-                       │
-                       ▼
-                  memory.db (compact DSL, token-budgeted)
-                       │
-                       ▼
-             AI tools READ memory.db at conversation start
+Repository ──► EXTRACT (files, symbols, imports, spans)
+                    │
+Conversations ──► APPEND to graph.log (JSONL)
+                    │
+                    ▼
+               COMPACTION (decay → archive → snapshot)
+                    │
+                    ▼
+               graph.snap  ──►  graph.db (rendered projection)
+                    │
+                    ▼
+         RETRIEVE (BM25 + proximity + PageRank + tags + recency)
+                    │
+                    ▼
+         AI tools call repo_map at conversation start
 ```
 
-- **Write path**: Append memories as JSONL — fast, no coordination
-- **Read path**: BM25 ranking with tags, type weights, and age decay
-- **Compaction**: Deduplicates, scores, enforces token budget
+- **Extraction**: deterministic, local, no model call and no CGO
+- **Spans, not copies**: the graph stores coordinates into files git already tracks
+- **Retrieval**: one pipeline, with a precision floor that drops rather than pads
+- **Compaction**: deduplicates, decays, archives, enforces the budget
+
+## MCP Tools
+
+| Tool | Replaces |
+|---|---|
+| `repo_map` | Reading files to find out where anything is |
+| `symbol_find` | grep and workspace search |
+| `symbol_read` | Whole-file reads |
+| `remember` | Losing the decision when the conversation ends |
+| `graph_status` | Guessing whether the map is trustworthy |
 
 ## Supported Platforms
+
+| OS | Architecture |
+|---|---|
+| Linux | x64, arm64 |
+| macOS | x64, arm64 (Apple Silicon) |
+| Windows | x64 |
+
+## Documentation
+
+Full documentation, design details, and CLI reference at [github.com/akashchekka/memor](https://github.com/akashchekka/memor).
+
+## License
+
+MIT
+
 
 | OS | Architecture |
 |---|---|

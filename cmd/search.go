@@ -1,127 +1,81 @@
-// search.go — memor search, memor query
+// search.go — memor search
 //
-// memor search: Keyword search across all memories using BM25 ranking.
-// Returns scored results sorted by relevance.
-//
-//	Flags: --top (number of results, default: 5)
-//
-//	Examples:
-//	  memor search "redis cache"
-//	  memor search "deploy" --top 10
-//	  memor search "pnpm build monorepo"
-//
-// memor query: Filter memories by tags. Returns all entries matching the tags.
-//
-//	Flags: --tags (required, comma-separated)
-//
-//	Examples:
-//	  memor query --tags "auth"
-//	  memor query --tags "db,perf"
+// Ranks the graph against a query and lists the matching nodes with their IDs,
+// so a memory can be found and superseded, or a file located by topic.
 package cmd
 
 import (
 	"fmt"
-	"os"
 	"strings"
 
-	"github.com/memor-dev/memor/internal/config"
-	"github.com/memor-dev/memor/internal/engine"
-	"github.com/memor-dev/memor/internal/store"
+	"github.com/memor-dev/memor/internal/graph"
+	"github.com/memor-dev/memor/internal/retrieve"
 	"github.com/spf13/cobra"
 )
 
-var searchTop int
+var (
+	searchLimit int
+	searchKind  string
+)
 
 var searchCmd = &cobra.Command{
-	Use:   "search [query]",
-	Short: "Search memories by keyword",
-	Args:  cobra.MinimumNArgs(1),
+	Use:   "search <query>",
+	Short: "Find nodes matching a query",
+	Args:  cobra.ExactArgs(1),
 	RunE:  runSearch,
 }
 
 func init() {
-	searchCmd.Flags().IntVar(&searchTop, "top", 5, "Number of results to return")
+	searchCmd.Flags().IntVarP(&searchLimit, "limit", "n", 10, "Maximum results")
+	searchCmd.Flags().StringVarP(&searchKind, "kind", "k", "", "Restrict to one kind: file, sym, pkg, ext, doc, mem")
 }
 
 func runSearch(cmd *cobra.Command, args []string) error {
-	cwd, err := os.Getwd()
+	sess, err := openSession()
+	if err != nil {
+		return err
+	}
+	g, ix, err := sess.Graph()
 	if err != nil {
 		return err
 	}
 
-	paths := store.ResolvePaths(cwd)
-	cfg, err := config.Load(paths.Config)
-	if err != nil {
-		return fmt.Errorf("load config: %w", err)
+	query := retrieve.Query{
+		Text:   args[0],
+		Limit:  searchLimit,
+		Budget: 1 << 30, // The limit does the bounding here, not the budget.
+	}
+	if searchKind != "" {
+		kind, ok := graph.ParseKind(strings.TrimSpace(searchKind))
+		if !ok {
+			return fmt.Errorf("unknown kind %q — use file, sym, pkg, ext, doc, or mem", searchKind)
+		}
+		query.Kinds = []graph.Kind{kind}
 	}
 
-	query := strings.Join(args, " ")
-	results, err := engine.Search(paths, cfg, query, searchTop)
-	if err != nil {
-		return err
-	}
-
-	if len(results) == 0 {
-		fmt.Println("No matches found.")
+	result := retrieve.Retrieve(g, ix, sess.Cfg, query)
+	if len(result.Nodes) == 0 {
+		fmt.Println("No matches above the precision floor.")
 		return nil
 	}
 
-	for i, r := range results {
-		fmt.Printf("%d. [%s] %s %s: %s (score: %.3f)\n",
-			i+1, r.ID, r.Type.Prefix(), renderTagList(r.Tags), r.Content, r.Score)
+	for _, s := range result.Nodes {
+		location := s.Node.Name
+		if s.Node.Span != nil && s.Node.Span.Path != "" && s.Node.Kind == graph.KindSym {
+			location = fmt.Sprintf("%s:%d %s", s.Node.Span.Path, s.Node.Span.L0, s.Node.Name)
+		}
+		fmt.Printf("%.3f  %-5s %s  [%s]\n", s.Score, s.Node.Kind, location, s.Node.ID)
+		if text := strings.TrimSpace(s.Node.Text); text != "" {
+			fmt.Printf("       %s\n", collapseLine(text, 120))
+		}
 	}
 	return nil
 }
 
-var queryTags string
-
-var queryCmd = &cobra.Command{
-	Use:   "query",
-	Short: "Query memories by tags",
-	RunE:  runQuery,
-}
-
-func init() {
-	queryCmd.Flags().StringVar(&queryTags, "tags", "", "Comma-separated tags to filter by")
-}
-
-func runQuery(cmd *cobra.Command, args []string) error {
-	if queryTags == "" {
-		return fmt.Errorf("--tags is required")
+func collapseLine(s string, max int) string {
+	s = strings.Join(strings.Fields(s), " ")
+	if len(s) > max {
+		return s[:max] + "..."
 	}
-
-	cwd, err := os.Getwd()
-	if err != nil {
-		return err
-	}
-
-	paths := store.ResolvePaths(cwd)
-	tags := strings.Split(queryTags, ",")
-	for i, t := range tags {
-		tags[i] = strings.TrimSpace(t)
-	}
-
-	results, err := engine.QueryByTags(paths, tags)
-	if err != nil {
-		return err
-	}
-
-	if len(results) == 0 {
-		fmt.Println("No entries found for those tags.")
-		return nil
-	}
-
-	for i, e := range results {
-		fmt.Printf("%d. [%s] %s %s: %s\n",
-			i+1, e.ID, e.Type.Prefix(), renderTagList(e.Tags), e.Content)
-	}
-	return nil
-}
-
-func renderTagList(tags []string) string {
-	var parts []string
-	for _, t := range tags {
-		parts = append(parts, "#"+t)
-	}
-	return strings.Join(parts, " ")
+	return s
 }

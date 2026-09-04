@@ -1,76 +1,86 @@
 // context.go — memor context
 //
-// The main entry point for AI agents. Retrieves the most relevant memories and
-// knowledge sections within a token budget. Outputs a ready-to-inject context block.
+// Prints the task-ranked repository map an agent should load before reading any
+// file. This is the CLI equivalent of the repo_map MCP tool.
 //
 // Flags:
 //
-//	--budget   Override token budget from config.toml
-//	--query    Filter by relevance to a specific task
+//	--query    What the user is trying to do; ranks the map for that task
+//	--tag      Topic tag to boost; repeatable
+//	--file     File already open in the editor; anchors ranking; repeatable
+//	--budget   Maximum tokens to emit
+//	--limit    Maximum nodes to emit
 //
 // Examples:
 //
 //	memor context
-//	memor context --query "fix flaky auth test"
-//	memor context --budget 5000 --query "deploy api"
+//	memor context --query "where is compaction handled"
+//	memor context --tag auth --budget 4000
 package cmd
 
 import (
 	"fmt"
 	"os"
-	"strings"
 
-	"github.com/memor-dev/memor/internal/config"
-	"github.com/memor-dev/memor/internal/engine"
-	"github.com/memor-dev/memor/internal/store"
+	"github.com/memor-dev/memor/internal/retrieve"
 	"github.com/spf13/cobra"
 )
 
 var (
-	contextBudget int
 	contextQuery  string
+	contextTags   []string
+	contextFiles  []string
+	contextBudget int
+	contextLimit  int
+	contextStats  bool
 )
 
 var contextCmd = &cobra.Command{
 	Use:   "context",
-	Short: "Get relevant context for a conversation",
-	Long:  "Retrieves the most relevant memories and knowledge sections within a token budget. The main command agents call at conversation start.",
+	Short: "Print the task-ranked repository map",
+	Args:  cobra.NoArgs,
 	RunE:  runContext,
 }
 
 func init() {
-	contextCmd.Flags().IntVar(&contextBudget, "budget", 0, "Token budget (default from config.toml)")
-	contextCmd.Flags().StringVar(&contextQuery, "query", "", "Query to find relevant context for")
+	contextCmd.Flags().StringVarP(&contextQuery, "query", "q", "", "What you are trying to do; ranks the map for that task")
+	contextCmd.Flags().StringSliceVarP(&contextTags, "tag", "t", nil, "Topic tag to boost (repeatable)")
+	contextCmd.Flags().StringSliceVarP(&contextFiles, "file", "f", nil, "File already open in the editor (repeatable)")
+	contextCmd.Flags().IntVarP(&contextBudget, "budget", "b", 0, "Maximum tokens to emit")
+	contextCmd.Flags().IntVarP(&contextLimit, "limit", "n", 0, "Maximum nodes to emit")
+	contextCmd.Flags().BoolVar(&contextStats, "stats", false, "Print token accounting to stderr")
 }
 
 func runContext(cmd *cobra.Command, args []string) error {
-	cwd, err := os.Getwd()
+	sess, err := openSession()
 	if err != nil {
 		return err
 	}
-
-	paths := store.ResolvePaths(cwd)
-	cfg, err := config.Load(paths.Config)
-	if err != nil {
-		return fmt.Errorf("load config: %w", err)
-	}
-
-	// Parse query from remaining args if not set via flag
-	query := contextQuery
-	if query == "" && len(args) > 0 {
-		query = strings.Join(args, " ")
-	}
-
-	opts := engine.ContextOptions{
-		Budget: contextBudget,
-		Query:  query,
-	}
-
-	result, err := engine.Context(paths, cfg, opts)
+	g, ix, err := sess.Graph()
 	if err != nil {
 		return err
 	}
+	if g.NodeCount() == 0 {
+		return fmt.Errorf("the graph is empty — run 'memor build' to index this repository")
+	}
 
-	fmt.Print(result)
+	files := make([]string, 0, len(contextFiles))
+	for _, f := range contextFiles {
+		files = append(files, sess.RelPath(f))
+	}
+
+	result := retrieve.Retrieve(g, ix, sess.Cfg, retrieve.Query{
+		Text:      contextQuery,
+		Tags:      contextTags,
+		OpenFiles: files,
+		Budget:    contextBudget,
+		Limit:     contextLimit,
+	})
+
+	fmt.Print(result.Text)
+	if contextStats {
+		fmt.Fprintf(os.Stderr, "\n%d nodes, %d/%d tokens, %d below the precision floor\n",
+			len(result.Nodes), result.Tokens, result.Budget, result.Rejected)
+	}
 	return nil
 }

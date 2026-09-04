@@ -1,190 +1,84 @@
 // import.go — memor import
 //
-// Imports memories from a JSONL file into the WAL. Supports dedup checking
-// and dry-run mode.
-//
-// Flags:
-//
-//	--tag              Add an extra tag to all imported entries
-//	--skip-duplicates  Skip entries whose content hash already exists
-//	--dry-run          Show what would be imported without writing
-//
-// Examples:
-//
-//	memor import backup.jsonl
-//	memor import decisions.jsonl --skip-duplicates
-//	memor import shared.jsonl --tag "imported"
-//	memor import backup.jsonl --dry-run
+// Reads JSONL produced by `memor export` and appends it to the log. Nodes are
+// content-addressed, so importing the same file twice is a no-op rather than a
+// duplication.
 package cmd
 
 import (
-	"bufio"
-	"encoding/json"
 	"fmt"
+	"io"
 	"os"
-	"strings"
 
-	"github.com/memor-dev/memor/internal/memory"
+	"github.com/memor-dev/memor/internal/graph"
 	"github.com/memor-dev/memor/internal/store"
 	"github.com/spf13/cobra"
 )
 
-var (
-	importTag      string
-	importSkipDups bool
-	importDryRun   bool
-)
-
 var importCmd = &cobra.Command{
-	Use:   "import <file>",
+	Use:   "import [file]",
 	Short: "Import memories from JSONL",
-	Long:  "Import memory entries from a JSONL file into the WAL.",
-	Args:  cobra.ExactArgs(1),
+	Args:  cobra.MaximumNArgs(1),
 	RunE:  runImport,
 }
 
-func init() {
-	importCmd.Flags().StringVar(&importTag, "tag", "", "Add an extra tag to all imported entries")
-	importCmd.Flags().BoolVar(&importSkipDups, "skip-duplicates", false, "Skip entries whose content hash already exists")
-	importCmd.Flags().BoolVar(&importDryRun, "dry-run", false, "Show what would be imported without writing")
-}
-
 func runImport(cmd *cobra.Command, args []string) error {
-	cwd, err := os.Getwd()
+	sess, err := openSession()
 	if err != nil {
 		return err
 	}
 
-	paths := store.ResolvePaths(cwd)
-	if !paths.Exists() {
-		return fmt.Errorf(".memor/ not found — run 'memor init' first")
-	}
-
-	inputPath := args[0]
-
-	// Read input JSONL
-	entries, err := readJSONLFile(inputPath)
-	if err != nil {
-		return fmt.Errorf("read input file: %w", err)
-	}
-
-	if len(entries) == 0 {
-		fmt.Println("No entries found in input file.")
-		return nil
-	}
-
-	// Build existing ID set for dedup
-	var existingIDs map[string]struct{}
-	if importSkipDups {
-		existingIDs, err = collectExistingIDs(paths)
+	var lines [][]byte
+	if len(args) == 0 {
+		data, err := io.ReadAll(os.Stdin)
 		if err != nil {
-			return fmt.Errorf("collect existing IDs: %w", err)
+			return fmt.Errorf("read stdin: %w", err)
+		}
+		lines = splitLines(data)
+	} else {
+		lines, err = store.ReadRecords(args[0])
+		if err != nil {
+			return err
 		}
 	}
 
-	toImport, skipped := prepareImportEntries(entries, existingIDs, importTag)
-
-	if len(toImport) == 0 {
-		fmt.Printf("No new entries to import (%d skipped as duplicates).\n", skipped)
+	records := graph.Decode(lines, "import")
+	if len(records) == 0 {
+		fmt.Println("Nothing to import.")
 		return nil
 	}
-
-	// Dry run — just show what would be imported
-	if importDryRun {
-		fmt.Printf("Dry run — would import %d entries (%d skipped):\n\n", len(toImport), skipped)
-		for _, e := range toImport {
-			fmt.Printf("  %s [%s] %s: %s\n", e.Type.Prefix(), e.ID[:8], renderTagList(e.Tags), e.Content)
-		}
-		return nil
+	if err := graph.Append(sess.Paths.Log, records); err != nil {
+		return err
+	}
+	if _, _, err := graph.Compact(sess.Paths, sess.Cfg); err != nil {
+		return err
 	}
 
-	// Write to WAL
-	for _, e := range toImport {
-		if err := store.AppendToWAL(paths.MemoryWAL, e); err != nil {
-			return fmt.Errorf("write WAL: %w", err)
-		}
-	}
-
-	fmt.Printf("Imported %d entries (%d skipped)\n", len(toImport), skipped)
-
-	maybeAutoCompact(paths)
-
+	fmt.Printf("Imported %d records\n", len(records))
 	return nil
 }
 
-func prepareImportEntries(entries []memory.Entry, existingIDs map[string]struct{}, importTag string) ([]memory.Entry, int) {
-	tag := strings.TrimSpace(strings.ToLower(importTag))
-	toImport := make([]memory.Entry, 0, len(entries))
-	skipped := 0
-	for _, entry := range entries {
-		if entry.ID == "" {
-			entry.ID = memory.ContentID(entry.Content)
-		}
-		if _, exists := existingIDs[entry.ID]; exists {
-			skipped++
+func splitLines(data []byte) [][]byte {
+	var out [][]byte
+	start := 0
+	for i, b := range data {
+		if b != '\n' {
 			continue
 		}
-		if tag != "" {
-			entry.Tags = append(entry.Tags, tag)
+		if line := trimCR(data[start:i]); len(line) > 0 {
+			out = append(out, line)
 		}
-		toImport = append(toImport, entry)
+		start = i + 1
 	}
-	return toImport, skipped
+	if line := trimCR(data[start:]); len(line) > 0 {
+		out = append(out, line)
+	}
+	return out
 }
 
-// readJSONLFile reads memory entries from a JSONL file.
-func readJSONLFile(path string) ([]memory.Entry, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
+func trimCR(line []byte) []byte {
+	if n := len(line); n > 0 && line[n-1] == '\r' {
+		return line[:n-1]
 	}
-	defer f.Close()
-
-	var entries []memory.Entry
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-
-	lineNum := 0
-	for scanner.Scan() {
-		lineNum++
-		line := scanner.Bytes()
-		if len(line) == 0 {
-			continue
-		}
-
-		var entry memory.Entry
-		if err := json.Unmarshal(line, &entry); err != nil {
-			fmt.Fprintf(os.Stderr, "warning: skipping malformed line %d: %v\n", lineNum, err)
-			continue
-		}
-		entries = append(entries, entry)
-	}
-
-	return entries, scanner.Err()
-}
-
-// collectExistingIDs returns a set of all content IDs from snapshot + WAL.
-func collectExistingIDs(paths store.Paths) (map[string]struct{}, error) {
-	ids := make(map[string]struct{})
-
-	snap, err := store.ReadSnapshot(paths.MemoryDB)
-	if err != nil {
-		return nil, err
-	}
-	for _, e := range snap.Entries {
-		ids[e.ID] = struct{}{}
-	}
-
-	walEntries, err := store.ReadWAL(paths.MemoryWAL)
-	if err != nil {
-		return nil, err
-	}
-	for _, e := range walEntries {
-		if e.ID == "" {
-			e.ID = memory.ContentID(e.Content)
-		}
-		ids[e.ID] = struct{}{}
-	}
-
-	return ids, nil
+	return line
 }

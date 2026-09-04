@@ -1,11 +1,16 @@
-// mcpconfig.go — MCP server registration for AI tool hosts
+// mcpconfig.go — MCP server registration
 //
-// Writes the memor stdio server into each host's MCP config so agents get the
-// memory tools natively instead of shelling out to the CLI. Hosts disagree on
+// Writes the memor stdio server into a host's MCP config so agents get the
+// graph tools natively instead of shelling out to the CLI. Hosts disagree on
 // the top-level key: VS Code uses "servers", everyone else uses "mcpServers".
+//
+// VS Code is registered by default and is the only host written without an
+// explicit --tools flag. This is the irreducible file: an MCP server cannot
+// discover itself.
 package cmd
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -21,29 +26,24 @@ type mcpHost struct {
 	key     string // matches --tools values
 	path    string // config file, relative to project root
 	rootKey string // "servers" for VS Code, "mcpServers" elsewhere
-	// detectDir gates default registration on that directory already existing.
-	// Empty means always register when no --tools flag is given.
-	detectDir string
+	// byDefault registers the host even when --tools is not given.
+	byDefault bool
 }
 
-// VS Code also reads a workspace .mcp.json natively, so the Claude Code entry
-// doubles as portable configuration for the Copilot Agent Host.
 var mcpHosts = []mcpHost{
-	{"GitHub Copilot", "copilot", filepath.Join(".vscode", "mcp.json"), "servers", ""},
-	{"Claude Code", "claude", ".mcp.json", "mcpServers", ".claude"},
-	{"Cursor", "cursor", filepath.Join(".cursor", "mcp.json"), "mcpServers", ".cursor"},
+	{"GitHub Copilot", "copilot", filepath.Join(".vscode", "mcp.json"), "servers", true},
+	{"Claude Code", "claude", ".mcp.json", "mcpServers", false},
+	{"Cursor", "cursor", filepath.Join(".cursor", "mcp.json"), "mcpServers", false},
 }
 
-// memorServerEntry is the stdio launch definition understood by every host.
-func memorServerEntry() map[string]interface{} {
-	return map[string]interface{}{
+func memorServerEntry() map[string]any {
+	return map[string]any{
 		"type":    "stdio",
 		"command": "memor",
-		"args":    []interface{}{"mcp"},
+		"args":    []any{"mcp"},
 	}
 }
 
-// parseToolsFlag splits a comma-separated --tools value into a lookup set.
 func parseToolsFlag(toolsFlag string) map[string]struct{} {
 	requested := make(map[string]struct{})
 	for _, t := range strings.Split(toolsFlag, ",") {
@@ -54,16 +54,12 @@ func parseToolsFlag(toolsFlag string) map[string]struct{} {
 	return requested
 }
 
-func (h mcpHost) selected(projectRoot string, requested map[string]struct{}, toolsFlag string) bool {
-	if toolsFlag != "" {
-		_, ok := requested[h.key]
-		return ok
+func (h mcpHost) selected(requested map[string]struct{}, toolsFlag string) bool {
+	if toolsFlag == "" {
+		return h.byDefault
 	}
-	if h.detectDir == "" {
-		return true
-	}
-	_, err := os.Stat(filepath.Join(projectRoot, h.detectDir))
-	return err == nil
+	_, ok := requested[h.key]
+	return ok || h.byDefault
 }
 
 func registerMCPServers(projectRoot, toolsFlag string) error {
@@ -71,7 +67,7 @@ func registerMCPServers(projectRoot, toolsFlag string) error {
 	registered := false
 
 	for _, h := range mcpHosts {
-		if !h.selected(projectRoot, requested, toolsFlag) {
+		if !h.selected(requested, toolsFlag) {
 			continue
 		}
 		added, err := addMCPServer(filepath.Join(projectRoot, h.path), h.rootKey)
@@ -85,12 +81,10 @@ func registerMCPServers(projectRoot, toolsFlag string) error {
 	}
 
 	if _, ok := requested["windsurf"]; ok {
-		fmt.Println("")
-		fmt.Println("Note: Windsurf stores MCP servers globally, not per project.")
+		fmt.Println("\nWindsurf stores MCP servers globally, not per project.")
 		fmt.Println("  Add this to ~/.codeium/windsurf/mcp_config.json:")
 		fmt.Println(`  "memor": { "command": "memor", "args": ["mcp"] }`)
 	}
-
 	if registered {
 		fmt.Println("Restart your editor to load the memor MCP tools.")
 	}
@@ -105,9 +99,9 @@ func addMCPServer(path, rootKey string) (bool, error) {
 		return false, err
 	}
 
-	servers, _ := m[rootKey].(map[string]interface{})
+	servers, _ := m[rootKey].(map[string]any)
 	if servers == nil {
-		servers = make(map[string]interface{})
+		servers = make(map[string]any)
 	}
 	if _, exists := servers[memorMCPServerName]; exists {
 		return false, nil
@@ -126,7 +120,7 @@ func removeMCPServer(path, rootKey string) (bool, error) {
 		return false, err
 	}
 
-	servers, _ := m[rootKey].(map[string]interface{})
+	servers, _ := m[rootKey].(map[string]any)
 	if servers == nil {
 		return false, nil
 	}
@@ -150,8 +144,8 @@ func removeMCPServer(path, rootKey string) (bool, error) {
 	return true, writeJSONFile(path, m)
 }
 
-// deregisterMCPServers removes memor from every host config that has it.
-func deregisterMCPServers(projectRoot string) {
+// deregisterMCPServer removes memor from every host config that has it.
+func deregisterMCPServer(projectRoot string) {
 	for _, h := range mcpHosts {
 		fullPath := filepath.Join(projectRoot, h.path)
 		if _, err := os.Stat(fullPath); os.IsNotExist(err) {
@@ -159,11 +153,42 @@ func deregisterMCPServers(projectRoot string) {
 		}
 		removed, err := removeMCPServer(fullPath, h.rootKey)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "warning: could not remove memor MCP server from %s: %v\n", h.path, err)
+			fmt.Fprintf(os.Stderr, "warning: could not remove memor from %s: %v\n", h.path, err)
 			continue
 		}
 		if removed {
 			fmt.Printf("Removed memor MCP server from %s\n", h.path)
 		}
 	}
+}
+
+// readJSONFile reads a JSON file into a map, returning an empty map when the
+// file does not exist or is blank.
+func readJSONFile(path string) (map[string]any, error) {
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return make(map[string]any), nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if len(strings.TrimSpace(string(data))) == 0 {
+		return make(map[string]any), nil
+	}
+	var m map[string]any
+	if err := json.Unmarshal(data, &m); err != nil {
+		return nil, fmt.Errorf("parse %s: %w", path, err)
+	}
+	return m, nil
+}
+
+func writeJSONFile(path string, m map[string]any) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, append(data, '\n'), 0o644)
 }

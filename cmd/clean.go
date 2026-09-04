@@ -1,28 +1,36 @@
 // clean.go — memor clean
 //
-// Resets all memory data — clears memory.db, memory.wal, memory.archive,
-// and knowledge.db. Preserves the .memor/ directory structure
-// and config.toml. Use when you want a fresh start without re-running init.
-//
-// Examples:
-//
-//	memor clean
+// Removes memor's footprint. By default it drops only the derived artifacts,
+// which are always safe to delete because they regenerate. --all removes the
+// whole .memor/ directory and deregisters the MCP server.
 package cmd
 
 import (
+	"bufio"
 	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
 
-	"github.com/memor-dev/memor/internal/constants"
 	"github.com/memor-dev/memor/internal/store"
 	"github.com/spf13/cobra"
 )
 
+var (
+	cleanAll   bool
+	cleanForce bool
+)
+
 var cleanCmd = &cobra.Command{
 	Use:   "clean",
-	Short: "Reset all memory data while keeping .memor/ and config",
-	Long:  "Clears memory.db, memory.wal, memory.archive, and knowledge.db. Preserves the .memor/ directory and config.toml.",
+	Short: "Remove derived artifacts, or the entire memor footprint",
+	Args:  cobra.NoArgs,
 	RunE:  runClean,
+}
+
+func init() {
+	cleanCmd.Flags().BoolVar(&cleanAll, "all", false, "Remove .memor/ entirely and deregister the MCP server")
+	cleanCmd.Flags().BoolVarP(&cleanForce, "force", "y", false, "Skip the confirmation prompt")
 }
 
 func runClean(cmd *cobra.Command, args []string) error {
@@ -30,53 +38,72 @@ func runClean(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-
-	paths := store.ResolvePaths(cwd)
+	root := store.FindProjectRoot(cwd)
+	paths := store.ResolvePaths(root)
 	if !paths.Exists() {
-		return fmt.Errorf(".memor/ not found — nothing to clean")
+		return fmt.Errorf("memor is not initialized for %s", cwd)
 	}
 
-	// clean rewrites the same files compaction owns, so take the state lock to
-	// keep a concurrent add or MCP session from half-surviving the reset.
-	lock, err := store.AcquireLock(paths.Lock, store.CompactLockTimeout)
-	if err != nil {
-		return fmt.Errorf("lock state: %w", err)
-	}
-	defer lock.Release()
-
-	// Reset memory.db to empty snapshot
-	if err := os.WriteFile(paths.MemoryDB, []byte(fmt.Sprintf("@mem v1 | 0 entries | budget:%d | compacted:none\n", constants.DefaultTokenBudget)), 0o644); err != nil {
-		return fmt.Errorf("reset memory.db: %w", err)
-	}
-	fmt.Println("Reset memory.db")
-	if err := os.Remove(paths.Snapshot); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("reset canonical snapshot: %w", err)
-	}
-
-	// Truncate memory.wal
-	if err := os.WriteFile(paths.MemoryWAL, nil, 0o644); err != nil {
-		return fmt.Errorf("reset memory.wal: %w", err)
-	}
-	fmt.Println("Reset memory.wal")
-
-	// Truncate archive
-	if err := os.WriteFile(paths.Archive, nil, 0o644); err != nil {
-		if !os.IsNotExist(err) {
-			return fmt.Errorf("reset memory.archive: %w", err)
+	if !cleanAll {
+		// graph.idx and graph.db are derived by definition, and the blob cache
+		// is a cache. Dropping them costs one rebuild and nothing else.
+		for _, path := range []string{paths.Idx, paths.DB} {
+			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+				return err
+			}
 		}
-	} else {
-		fmt.Println("Reset memory.archive")
-	}
-
-	// Truncate knowledge.db
-	if err := os.WriteFile(paths.Knowledge, nil, 0o644); err != nil {
-		if !os.IsNotExist(err) {
-			return fmt.Errorf("reset knowledge.db: %w", err)
+		if err := os.RemoveAll(paths.Blobs); err != nil {
+			return err
 		}
-	} else {
-		fmt.Println("Reset knowledge.db")
+		fmt.Println("Removed derived artifacts. They regenerate on the next command.")
+		return nil
 	}
 
-	fmt.Println("Clean complete — .memor/ directory and config.toml preserved.")
+	if !cleanForce && !confirm(fmt.Sprintf("Delete %s and every memory it holds?", paths.Root)) {
+		fmt.Println("Cancelled.")
+		return nil
+	}
+
+	if err := os.RemoveAll(paths.Root); err != nil {
+		return err
+	}
+	fmt.Printf("Removed %s\n", paths.Root)
+
+	deregisterMCPServer(root)
+	removeGitignoreEntry(root)
 	return nil
+}
+
+func confirm(prompt string) bool {
+	fmt.Printf("%s [y/N] ", prompt)
+	reader := bufio.NewReader(os.Stdin)
+	answer, err := reader.ReadString('\n')
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(answer), "y")
+}
+
+func removeGitignoreEntry(root string) {
+	path := filepath.Join(root, ".gitignore")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+
+	var kept []string
+	removed := false
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.TrimSpace(line) == store.DirName+"/" {
+			removed = true
+			continue
+		}
+		kept = append(kept, line)
+	}
+	if !removed {
+		return
+	}
+	if err := os.WriteFile(path, []byte(strings.Join(kept, "\n")), 0o644); err == nil {
+		fmt.Println("Removed .memor/ from .gitignore")
+	}
 }
